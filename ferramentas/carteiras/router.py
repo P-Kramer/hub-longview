@@ -58,8 +58,8 @@ import streamlit as st
 
 def render(ctx):
     init_favoritos_schema()
-    if st.session_state.pagina_atual_carteira == "menu":
-        op = st.sidebar.radio(
+    
+    op = st.sidebar.radio(
         "Telas do Dashboard",
         ["Tela 1 – Carteira", "Tela 2 – Risco", "Tela 3 – Compliance", "Tela 4 - Macro Stress"],
         index=0,

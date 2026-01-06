@@ -160,68 +160,6 @@ st.markdown(
 # TELAS
 # =========================
 def tela_login():
-    import streamlit as st
-    def turso_pipeline_url() -> str:
-        # doc: replace libsql:// with https:// and append /v2/pipeline :contentReference[oaicite:1]{index=1}
-        base = st.secrets["TURSO"]["DATABASE_URL"].replace("libsql://", "https://").rstrip("/")
-        return f"{base}/v2/pipeline"
-
-    def turso_exec(sql: str, args=None):
-        url = turso_pipeline_url()
-        token = st.secrets["TURSO"]["AUTH_TOKEN"]
-
-        payload = {
-            "requests": [
-                {"type": "execute", "stmt": {"sql": sql}},
-                {"type": "close"},
-            ]
-        }
-
-        # Se quiser parâmetros posicionais (?), use args conforme referência :contentReference[oaicite:2]{index=2}
-        if args is not None:
-            payload["requests"][0]["stmt"]["args"] = args
-
-        r = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def db_check():
-        st.title("DB Check (Turso) - HTTP")
-
-        st.write("DATABASE_URL ok:", bool(st.secrets.get("TURSO", {}).get("DATABASE_URL")))
-        st.write("AUTH_TOKEN ok:", bool(st.secrets.get("TURSO", {}).get("AUTH_TOKEN")))
-
-        # Ping
-        out = turso_exec("SELECT 1 AS ok;")
-        st.success(f"SELECT 1 OK: {out['results'][0]['response']['result']}")
-
-        # Create + Insert + Select
-        turso_exec("""
-            CREATE TABLE IF NOT EXISTS _db_check (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT DEFAULT (datetime('now')),
-                note TEXT
-            );
-        """)
-
-        turso_exec("INSERT INTO _db_check (note) VALUES ('hello');")
-        out2 = turso_exec("SELECT id, created_at, note FROM _db_check ORDER BY id DESC LIMIT 5;")
-
-        st.success("Escrita/leitura OK. Resultado:")
-        st.write(out2["results"][0]["response"]["result"])
-
-    try:
-        db_check()
-    except Exception as e:
-        st.error(f"Falhou: {e}")
     left, center, right = st.columns([1, 2, 1])
     with center:
         st.title("Longview Hub")
