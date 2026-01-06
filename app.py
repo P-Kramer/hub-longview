@@ -1,6 +1,6 @@
 import requests
 import streamlit as st
-import libsql_client
+import libsql
 from datetime import datetime, timedelta
 
 from utils import BASE_URL_API, CLIENT_ID, CLIENT_SECRET
@@ -161,49 +161,113 @@ st.markdown(
 # =========================
 def tela_login():
     import streamlit as st
-    from libsql_client import create_client
+    def turso_pipeline_url() -> str:
+        # doc: replace libsql:// with https:// and append /v2/pipeline :contentReference[oaicite:1]{index=1}
+        base = st.secrets["TURSO"]["DATABASE_URL"].replace("libsql://", "https://").rstrip("/")
+        return f"{base}/v2/pipeline"
 
-    @st.cache_resource
-    def get_db():
-        try:
-            url = st.secrets["TURSO"]["DATABASE_URL"]
-            token = st.secrets["TURSO"]["AUTH_TOKEN"]
-        except Exception as e:
-            raise RuntimeError(f"Secrets TURSO ausentes/errados: {e}")
-
-        return create_client(url=url, auth_token=token)
-
-    def check_db():
-        st.title("DB Check (Turso)")
-
-        url = st.secrets["TURSO"]["DATABASE_URL"]
+    def turso_exec(sql: str, args=None):
+        url = turso_pipeline_url()
         token = st.secrets["TURSO"]["AUTH_TOKEN"]
 
-        st.write("DATABASE_URL ok:", bool(url))
-        st.write("AUTH_TOKEN ok:", bool(token))
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql}},
+                {"type": "close"},
+            ]
+        }
 
-        with libsql_client.create_client_sync(url, auth_token=token) as db:
-            r = db.execute("SELECT 1 AS ok;").rows
-            st.success(f"Conexão ok. SELECT 1 retornou: {r}")
+        # Se quiser parâmetros posicionais (?), use args conforme referência :contentReference[oaicite:2]{index=2}
+        if args is not None:
+            payload["requests"][0]["stmt"]["args"] = args
 
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS _db_check (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT DEFAULT (datetime('now')),
-                    note TEXT
-                );
-            """)
-            db.execute("INSERT INTO _db_check (note) VALUES (?);", ("hello",))
-            rows = db.execute("SELECT id, created_at, note FROM _db_check ORDER BY id DESC LIMIT 5;").rows
-            st.success("Escrita/leitura ok. Últimas linhas:")
-            st.write(rows)
-            db.execute("DELETE FROM _db_check WHERE note = ?;", ("hello",))
-            st.info("Cleanup feito.")
+        r = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def db_check():
+        st.title("DB Check (Turso) - HTTP")
+
+        st.write("DATABASE_URL ok:", bool(st.secrets.get("TURSO", {}).get("DATABASE_URL")))
+        st.write("AUTH_TOKEN ok:", bool(st.secrets.get("TURSO", {}).get("AUTH_TOKEN")))
+
+        # Ping
+        out = turso_exec("SELECT 1 AS ok;")
+        st.success(f"SELECT 1 OK: {out['results'][0]['response']['result']}")
+
+        # Create + Insert + Select
+        turso_exec("""
+            CREATE TABLE IF NOT EXISTS _db_check (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT (datetime('now')),
+                note TEXT
+            );
+        """)
+
+        turso_exec("INSERT INTO _db_check (note) VALUES ('hello');")
+        out2 = turso_exec("SELECT id, created_at, note FROM _db_check ORDER BY id DESC LIMIT 5;")
+
+        st.success("Escrita/leitura OK. Resultado:")
+        st.write(out2["results"][0]["response"]["result"])
 
     try:
-        check_db()
+        db_check()
     except Exception as e:
         st.error(f"Falhou: {e}")
+    left, center, right = st.columns([1, 2, 1])
+    with center:
+        st.title("Longview Hub")
+        st.caption("Acesso restrito")
+
+        email = st.text_input("E-mail")
+        senha = st.text_input("Senha de aplicação", type="password")
+
+        if st.button("Entrar", use_container_width=True):
+            if not email or not senha:
+                st.error("Informe e-mail e senha.")
+                return
+
+            try:
+                with st.spinner("Autenticando..."):
+                    token, headers, expira_em = autenticar(email, senha)
+
+                st.session_state.token = token
+                st.session_state.headers = headers
+                st.session_state.token_expira_em = expira_em
+
+                st.query_params.clear()
+                ir_para("hub")
+                st.rerun()
+
+            except requests.HTTPError as http_err:
+                status = getattr(http_err.response, "status_code", None)
+                try:
+                    j = http_err.response.json()
+                    msg_api = j.get("detail") or j.get("message")
+                except Exception:
+                    msg_api = None
+
+                if status == 401:
+                    st.error("Credenciais inválidas. Verifique e-mail e senha.")
+                elif status == 403:
+                    st.error("Acesso negado. Verifique credenciais Cloudflare e permissões.")
+                else:
+                    st.error(f"Erro HTTP {status or ''}".strip() + (f": {msg_api}" if msg_api else ""))
+
+            except requests.Timeout:
+                st.error("Tempo de conexão esgotado. Tente novamente.")
+            except requests.ConnectionError:
+                st.error("Falha de conexão. Verifique sua rede ou a disponibilidade da API.")
+            except Exception as e:
+                st.error(f"Erro ao autenticar: {e}")
 
 def tela_hub():
     exigir_auth()
