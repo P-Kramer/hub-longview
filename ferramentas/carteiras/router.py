@@ -14,6 +14,7 @@ from .functions import (
     reset_column_selection, select_all, clear_all,
     clear_data_if_portfolios_changed, formatar_percentuais_df
 )
+from .turso_http import init_favoritos_schema
 from .rename_carteira import (
     mapa_renomeacao_ativos, mapa_renomeacao_cpr, rename
 )
@@ -56,6 +57,7 @@ import streamlit as st
 
 
 def render(ctx):
+    init_favoritos_schema()
     if st.session_state.pagina_atual_carteira == "menu":
         op = st.sidebar.radio(
         "Telas do Dashboard",

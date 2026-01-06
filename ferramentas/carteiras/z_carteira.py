@@ -1,12 +1,18 @@
+import math
+from datetime import date
+from io import BytesIO
+
+import pandas as pd
 import requests
 import streamlit as st
-from datetime import date
-import pandas as pd
-from io import BytesIO
-import math
 
 from utils import CARTEIRAS
-from .rename_carteira import rename, mapa_renomeacao_ativos, mapa_renomeacao_cpr
+from .rename_carteira import mapa_renomeacao_ativos, mapa_renomeacao_cpr
+
+from .turso_http import init_favoritos_schema, load_favoritos, toggle_favorito
+
+TELA_ID = "carteiras"
+ABAS = ["Overview Carteira", "Ativos", "CPR"]
 
 from .functions import (
     aplicar_estilo_percentual,
@@ -22,8 +28,7 @@ from .functions import (
 # Helpers de estado
 # -----------------------------
 def _init_state():
-    abas = ["Overview Carteira", "Ativos", "CPR"]
-
+    # DataFrames
     if "df" not in st.session_state or not isinstance(st.session_state.df, pd.DataFrame):
         st.session_state.df = pd.DataFrame()
 
@@ -33,9 +38,14 @@ def _init_state():
     if "df_cpr" not in st.session_state or not isinstance(st.session_state.df_cpr, pd.DataFrame):
         st.session_state.df_cpr = pd.DataFrame()
 
+    # Portfolios
     if "selected_portfolios" not in st.session_state:
         st.session_state.selected_portfolios = []
 
+    if "last_selected_portfolios" not in st.session_state:
+        st.session_state.last_selected_portfolios = []
+
+    # Colunas por dataset
     if "colunas_overview" not in st.session_state:
         st.session_state.colunas_overview = []
 
@@ -45,24 +55,17 @@ def _init_state():
     if "colunas_cpr" not in st.session_state:
         st.session_state.colunas_cpr = []
 
-    # seleções por aba
+    # Seleções por aba (para export)
     if "selecoes_colunas" not in st.session_state or not isinstance(st.session_state.selecoes_colunas, dict):
-        st.session_state.selecoes_colunas = {aba: [] for aba in abas}
+        st.session_state.selecoes_colunas = {aba: [] for aba in ABAS}
     else:
-        for aba in abas:
+        for aba in ABAS:
             st.session_state.selecoes_colunas.setdefault(aba, [])
-
-    # favoritos por aba
-    if "favoritos_colunas" not in st.session_state or not isinstance(st.session_state.favoritos_colunas, dict):
-        st.session_state.favoritos_colunas = {aba: [] for aba in abas}
-    else:
-        for aba in abas:
-            st.session_state.favoritos_colunas.setdefault(aba, [])
 
     if "colunas_selecionadas" not in st.session_state:
         st.session_state.colunas_selecionadas = []
 
-    return abas
+    return ABAS
 
 
 def _drop_repetidos(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,8 +78,8 @@ def _drop_repetidos(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _renomear_overview(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     rename_map = {
         "profitability_start_date": "%Dt Início",
@@ -137,7 +140,7 @@ def _renomear_overview(df: pd.DataFrame) -> pd.DataFrame:
         "benchmark_profitability.profitability_in_36_months": "Bench %36 Meses",
         "benchmark_profitability.profitability_in_48_months": "Bench %48 Meses",
         "benchmark_profitability.profitability_in_60_months": "Bench %60 Meses",
-        # attribution (mantive só os úteis; repetidos serão dropados)
+        # attribution
         "attribution.portfolio_beta.financial_value": "PnL Beta",
         "attribution.portfolio_beta.percentage_value": "PnL % Beta",
         "attribution.total.financial_value": "PnL Total",
@@ -159,15 +162,10 @@ def _renomear_overview(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _explode_e_traduz_listas(df_overview: pd.DataFrame):
-    """
-    - Garante que colunas 'Ativos' e 'CPR' existem no overview como listas (ou vazias).
-    - Cria df_ativos e df_cpr concatenados, já renomeados.
-    - Reescreve as colunas Ativos/CPR no overview como lista de dicts (ou []).
-    """
-    if df_overview.empty:
+    if df_overview is None or df_overview.empty:
         return pd.DataFrame(), pd.DataFrame(), df_overview
 
-    # Ativos
+    # ATIVOS
     df_ativos_concat = pd.DataFrame()
     if "Ativos" in df_overview.columns:
         lista_ativos_df = []
@@ -214,6 +212,19 @@ def _explode_e_traduz_listas(df_overview: pd.DataFrame):
 # Tela
 # -----------------------------
 def mostrar_carteira(ctx=None):
+    # ---------- FAVORITOS (Turso) ----------
+    init_favoritos_schema()
+
+    if "favoritos_db" not in st.session_state or not isinstance(st.session_state.favoritos_db, dict):
+        st.session_state.favoritos_db = {}
+
+    if TELA_ID not in st.session_state.favoritos_db:
+        st.session_state.favoritos_db[TELA_ID] = load_favoritos(TELA_ID)
+
+    for a in ABAS:
+        st.session_state.favoritos_db[TELA_ID].setdefault(a, [])
+
+    # ---------- STATE GERAL ----------
     abas = _init_state()
 
     st.title("Carteira")
@@ -221,7 +232,8 @@ def mostrar_carteira(ctx=None):
 
     data_inicio, data_fim = st.date_input(
         "Escolha o intervalo de datas",
-        [date.today(), date.today()]
+        [date.today(), date.today()],
+        key="intervalo_datas_carteira",
     )
 
     col1, col2 = st.columns([3, 1])
@@ -231,7 +243,7 @@ def mostrar_carteira(ctx=None):
             options=list(CARTEIRAS.values()),
             default=[],
             format_func=lambda x: x,
-            key="portfolio_multiselect"
+            key="portfolio_multiselect",
         )
 
     selected_ids = [k for k, v in CARTEIRAS.items() if v in portfolio_names]
@@ -239,10 +251,13 @@ def mostrar_carteira(ctx=None):
 
     with col2:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+
+        # garante que a função não exploda por falta de last_selected_portfolios
+        if "last_selected_portfolios" not in st.session_state:
+            st.session_state.last_selected_portfolios = []
         clear_data_if_portfolios_changed()
 
-        buscar = st.button("Buscar dados")
-        if buscar:
+        if st.button("Buscar dados", key="btn_buscar_dados_carteira"):
             if not selected_ids:
                 st.warning("Selecione pelo menos uma carteira.")
             else:
@@ -250,11 +265,11 @@ def mostrar_carteira(ctx=None):
                     "start_date": str(data_inicio),
                     "end_date": str(data_fim),
                     "instrument_position_aggregation": 3,
-                    "portfolio_ids": selected_ids
+                    "portfolio_ids": selected_ids,
                 }
 
                 try:
-                    if "headers" not in st.session_state:
+                    if "headers" not in st.session_state or not st.session_state.headers:
                         raise RuntimeError("headers não encontrados em st.session_state. Você precisa autenticar antes.")
 
                     r = requests.post(
@@ -293,11 +308,9 @@ def mostrar_carteira(ctx=None):
                         nomes = ", ".join([get_portfolio_name(pid) for pid in selected_ids])
                         st.success(f"Dados recebidos com sucesso para: {nomes}")
 
-                        # Formata percentuais no DF (se sua função mexe em st.session_state.df)
                         formatar_percentuais_df()
 
-                        # NÃO reseta seleções aqui toda hora (isso é o que te ferrava).
-                        # Se você quiser resetar APENAS quando buscar novos dados, faça aqui conscientemente:
+                        # resetar seleções só quando buscar novos dados
                         reset_column_selection()
 
                 except Exception as e:
@@ -312,7 +325,7 @@ def mostrar_carteira(ctx=None):
     st.dataframe(aplicar_estilo_percentual(st.session_state.df), use_container_width=True)
 
     st.markdown("## Selecionar colunas para exportar")
-    aba = st.radio("Escolha a aba para configurar:", abas, key="aba_config")
+    aba = st.radio("Escolha a aba para configurar:", abas, key="aba_config_carteira")
 
     colunas_disponiveis = {
         "Overview Carteira": [c for c in st.session_state.colunas_overview if "repetido" not in c.lower()],
@@ -321,7 +334,7 @@ def mostrar_carteira(ctx=None):
     }
 
     prefixo_checkbox = {"Overview Carteira": "ov_", "Ativos": "atv_", "CPR": "cpr_"}
-    colunas_aba = sorted(colunas_disponiveis[aba])
+    colunas_aba = sorted(colunas_disponiveis.get(aba, []))
     prefixo = prefixo_checkbox[aba]
 
     # Ações rápidas
@@ -329,34 +342,30 @@ def mostrar_carteira(ctx=None):
     ac1, ac2, ac3 = st.columns([1, 1, 1])
 
     with ac1:
-        if st.button("Selecionar todas", key=f"select_all_{aba}"):
+        if st.button("Selecionar todas", key=f"select_all_{TELA_ID}_{aba}"):
             st.session_state.selecoes_colunas[aba] = colunas_aba
             for c in colunas_aba:
                 st.session_state[f"{prefixo}{c}"] = True
             st.rerun()
 
     with ac2:
-        if st.button("Limpar seleção", key=f"clear_all_{aba}"):
+        if st.button("Limpar seleção", key=f"clear_all_{TELA_ID}_{aba}"):
             st.session_state.selecoes_colunas[aba] = []
             for c in colunas_aba:
                 st.session_state[f"{prefixo}{c}"] = False
             st.rerun()
 
     with ac3:
-        if st.button("Favoritos", key=f"select_fav_{aba}"):
-            favs = st.session_state.favoritos_colunas.get(aba, [])
-            st.session_state.selecoes_colunas[aba] = favs
+        if st.button("Favoritos", key=f"apply_fav_{TELA_ID}_{aba}"):
+            favs = st.session_state.favoritos_db[TELA_ID].get(aba, [])
+            favs_ok = [c for c in favs if c in colunas_aba]
+            st.session_state.selecoes_colunas[aba] = favs_ok
             for c in colunas_aba:
-                st.session_state[f"{prefixo}{c}"] = c in favs
+                st.session_state[f"{prefixo}{c}"] = c in favs_ok
             st.rerun()
 
-    # Export (mantive como você tinha: overview por carteira)
-    if st.button("Exportar para Excel", key="btn_export_excel"):
-        # Aqui você tem duas escolhas:
-        # (1) exigir pelo menos 1 col por aba (como você fazia)
-        # (2) exportar apenas a aba atual / apenas overview
-        #
-        # Mantive sua regra (1), mas agora ela funciona porque inicializamos o estado direito.
+    # Export
+    if st.button("Exportar para Excel", key="btn_export_excel_carteira"):
         if (
             not st.session_state.selecoes_colunas["Overview Carteira"]
             or not st.session_state.selecoes_colunas["Ativos"]
@@ -365,32 +374,25 @@ def mostrar_carteira(ctx=None):
             st.warning("Selecione pelo menos uma coluna de cada aba.")
         else:
             try:
-                df_overview = st.session_state.df.copy()
+                df_overview_full = st.session_state.df.copy()
 
-                # filtra colunas do overview conforme seleção
-                cols_ov = st.session_state.selecoes_colunas["Overview Carteira"]
-                cols_ov = [c for c in cols_ov if c in df_overview.columns]
-                if cols_ov:
-                    df_overview = df_overview[cols_ov]
+                # seleção do overview
+                cols_ov = [c for c in st.session_state.selecoes_colunas["Overview Carteira"] if c in df_overview_full.columns]
 
                 output = BytesIO()
-                nomes_arquivo = "_".join(
-                    [get_portfolio_name(pid).replace(" ", "_") for pid in st.session_state.selected_portfolios]
-                )
+                nomes_arquivo = "_".join([get_portfolio_name(pid).replace(" ", "_") for pid in st.session_state.selected_portfolios])
 
                 with pd.ExcelWriter(output, engine="openpyxl") as writer:
                     for pid in st.session_state.selected_portfolios:
                         nome = get_portfolio_name(pid)
-                        # se a coluna "ID Carteira" não estiver nas seleções, não dá pra filtrar por pid
+
                         if "ID Carteira" in st.session_state.df.columns:
                             df_port = st.session_state.df[st.session_state.df["ID Carteira"] == pid].copy()
                         else:
                             df_port = st.session_state.df.copy()
 
-                        # aplica seleção de colunas do overview
                         if cols_ov:
-                            cols_ok = [c for c in cols_ov if c in df_port.columns]
-                            df_port = df_port[cols_ok]
+                            df_port = df_port[[c for c in cols_ov if c in df_port.columns]]
 
                         if not df_port.empty:
                             format_excel_sheet(writer, df_port, nome)
@@ -416,43 +418,40 @@ def mostrar_carteira(ctx=None):
     n_linhas = math.ceil(len(colunas_aba) / n_cols)
 
     colunas_selecionadas_aba = []
-    favoritos_aba = list(st.session_state.favoritos_colunas.get(aba, []))
 
     for linha in range(n_linhas):
         st_cols = st.columns(n_cols, gap="large")
         for i, col in enumerate(colunas_aba[linha * n_cols:(linha + 1) * n_cols]):
             with st_cols[i]:
                 key_cb = f"{prefixo}{col}"
-                key_fav = f"fav_{prefixo}{col}"
-                key_btn = f"btnfav_{prefixo}{col}"
-
-                if key_fav not in st.session_state:
-                    st.session_state[key_fav] = col in favoritos_aba
-
                 row_cols = st.columns([0.85, 0.15])
+
                 with row_cols[0]:
                     checked = st.checkbox(
                         col,
                         value=(col in st.session_state.selecoes_colunas[aba]),
-                        key=key_cb
+                        key=key_cb,
                     )
+
                 with row_cols[1]:
-                    estrela = "⭐" if st.session_state[key_fav] else "☆"
-                    if st.button(estrela, key=key_btn):
-                        st.session_state[key_fav] = not st.session_state[key_fav]
-                        if st.session_state[key_fav]:
-                            if col not in favoritos_aba:
-                                favoritos_aba.append(col)
-                        else:
-                            if col in favoritos_aba:
-                                favoritos_aba.remove(col)
+                    is_fav = col in st.session_state.favoritos_db[TELA_ID].get(aba, [])
+                    estrela = "⭐" if is_fav else "☆"
+
+                    if st.button(estrela, key=f"fav_{TELA_ID}_{aba}_{col}"):
+                        novo = toggle_favorito(TELA_ID, aba, col)
+
+                        st.session_state.favoritos_db[TELA_ID].setdefault(aba, [])
+                        if novo and col not in st.session_state.favoritos_db[TELA_ID][aba]:
+                            st.session_state.favoritos_db[TELA_ID][aba].append(col)
+                        if (not novo) and col in st.session_state.favoritos_db[TELA_ID][aba]:
+                            st.session_state.favoritos_db[TELA_ID][aba].remove(col)
+
                         st.rerun()
 
                 if checked:
                     colunas_selecionadas_aba.append(col)
 
     st.session_state.selecoes_colunas[aba] = colunas_selecionadas_aba
-    st.session_state.favoritos_colunas[aba] = favoritos_aba
 
     st.session_state.colunas_selecionadas = (
         st.session_state.selecoes_colunas["Overview Carteira"]

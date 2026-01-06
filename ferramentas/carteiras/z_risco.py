@@ -1,52 +1,102 @@
+import math
+from datetime import date
+from io import BytesIO
+
+import pandas as pd
 import requests
 import streamlit as st
-from datetime import date
-import pandas as pd
-from io import BytesIO
-from openpyxl.styles import PatternFill, Font, Color
-from openpyxl.utils import get_column_letter
-import os
-import json
 
-from .functions import (
-    buscar_dados_liquidez, buscar_dados_resgates, aplicar_estilo_percentual, clear_all, select_all, get_portfolio_name, get_column_letter, get_repeated_columns, get_valid_columns, ir_para, clear_data_if_portfolios_changed, reset_column_selection, formatar_percentuais_df, BASE_URL_API, format_excel_sheet_risco
-)
-
-from utils import  CARTEIRAS
+from utils import CARTEIRAS
 from .rename_risco import rename
 
-def garantir_abas_favoritos(dicionario, abas):
-    if not isinstance(dicionario, dict):
-        dicionario = {}
-    for aba in abas:
-        if aba not in dicionario or not isinstance(dicionario[aba], list):
-            dicionario[aba] = []
-    return dicionario
+from .turso_http import init_favoritos_schema, load_favoritos, toggle_favorito
 
-def mostrar_risco():
-    st.title("Risco")
-    st.subheader("Buscar posições")
+from .functions import (
+    buscar_dados_liquidez,
+    buscar_dados_resgates,
+    get_portfolio_name,
+    clear_data_if_portfolios_changed,
+    format_excel_sheet_risco,
+)
 
-    abas_esperadas = ["Liquidez", "Resgates", "ADTV"]
-
-    # SEMPRE CARREGA favoritos de GSheet, nunca só na inicialização!
+TELA_ID = "risco"
+ABAS = ["Liquidez", "Resgates", "ADTV"]
 
 
-
-    # Inicialização dos estados de sessão para seleção de colunas
-    if "selecoes_colunas" not in st.session_state or not isinstance(st.session_state.selecoes_colunas, dict):
-        st.session_state.selecoes_colunas = {aba: [] for aba in abas_esperadas}
+# -----------------------------
+# Estado mínimo
+# -----------------------------
+def _init_state():
+    # seleções por aba
+    if "selecoes_colunas_risco" not in st.session_state or not isinstance(st.session_state.selecoes_colunas_risco, dict):
+        st.session_state.selecoes_colunas_risco = {aba: [] for aba in ABAS}
     else:
-        for aba in abas_esperadas:
-            if aba not in st.session_state.selecoes_colunas:
-                st.session_state.selecoes_colunas[aba] = []
+        for aba in ABAS:
+            st.session_state.selecoes_colunas_risco.setdefault(aba, [])
 
-    # Inicialização do estado de carregamento dos dados
+    # carregamento
     if "risco_dados_carregados" not in st.session_state:
         st.session_state.risco_dados_carregados = False
 
-    # Seletor de intervalo de datas
-    data_inicio, data_fim = st.date_input("Escolha o intervalo de datas", [date.today(), date.today()])
+    # dfs
+    if "df_liquidez" not in st.session_state or not isinstance(st.session_state.df_liquidez, pd.DataFrame):
+        st.session_state.df_liquidez = pd.DataFrame()
+    if "df_resgates" not in st.session_state or not isinstance(st.session_state.df_resgates, pd.DataFrame):
+        st.session_state.df_resgates = pd.DataFrame()
+    if "df_adtv" not in st.session_state or not isinstance(st.session_state.df_adtv, pd.DataFrame):
+        st.session_state.df_adtv = pd.DataFrame()
+
+    # colunas
+    if "colunas_liquidez" not in st.session_state:
+        st.session_state.colunas_liquidez = []
+    if "colunas_resgates" not in st.session_state:
+        st.session_state.colunas_resgates = []
+    if "colunas_adtv" not in st.session_state:
+        st.session_state.colunas_adtv = []
+
+    # portfolios
+    if "selected_portfolios" not in st.session_state:
+        st.session_state.selected_portfolios = []
+    if "last_selected_portfolios" not in st.session_state:
+        st.session_state.last_selected_portfolios = []
+
+
+def _init_favoritos_db():
+    init_favoritos_schema()
+
+    if "favoritos_db" not in st.session_state or not isinstance(st.session_state.favoritos_db, dict):
+        st.session_state.favoritos_db = {}
+
+    if TELA_ID not in st.session_state.favoritos_db:
+        st.session_state.favoritos_db[TELA_ID] = load_favoritos(TELA_ID)
+
+    for a in ABAS:
+        st.session_state.favoritos_db[TELA_ID].setdefault(a, [])
+
+
+def _colunas_disponiveis():
+    return {
+        "Liquidez": [c for c in st.session_state.colunas_liquidez if "repetido" not in str(c).lower()],
+        "Resgates": [c for c in st.session_state.colunas_resgates if "repetido" not in str(c).lower()],
+        "ADTV": [c for c in st.session_state.colunas_adtv if "repetido" not in str(c).lower()],
+    }
+
+
+# -----------------------------
+# Tela
+# -----------------------------
+def mostrar_risco(ctx=None):
+    _init_state()
+    _init_favoritos_db()
+
+    st.title("Risco")
+    st.subheader("Buscar posições")
+
+    data_inicio, data_fim = st.date_input(
+        "Escolha o intervalo de datas",
+        [date.today(), date.today()],
+        key="risco_intervalo_datas",
+    )
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -55,46 +105,51 @@ def mostrar_risco():
             options=list(CARTEIRAS.values()),
             default=[],
             format_func=lambda x: x,
-            key="portfolio_multiselect"
+            key="risco_portfolio_multiselect",
         )
 
-    # Obter IDs das carteiras selecionadas
     selected_ids = [k for k, v in CARTEIRAS.items() if v in portfolio_names]
     st.session_state.selected_portfolios = selected_ids
+
+    # limpa dados se mudou carteira (não mexe em favoritos)
     clear_data_if_portfolios_changed()
 
     with col2:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-        if st.button("Buscar dados") and selected_ids:
+
+        if st.button("Buscar dados", key="risco_btn_buscar") and selected_ids:
             try:
-                # Buscar dados das APIs
+                # Liquidez e Resgates
                 df_liq = buscar_dados_liquidez(data_inicio, data_fim, selected_ids)
                 df_res = buscar_dados_resgates(data_inicio, data_fim, selected_ids)
 
-                # Processar dados de ADTV
+                # ADTV vem das observations do retorno de liquidez (como você fazia)
                 adtv_rows = []
-                for obs in df_liq.get("observations", []):
-                    adtv_rows.extend(obs)
+                # df_liq pode ser dict: {"main": df, "observations": [...]}
+                obs_list = df_liq.get("observations", []) if isinstance(df_liq, dict) else []
+                for obs in obs_list:
+                    if isinstance(obs, list):
+                        adtv_rows.extend(obs)
+
                 df_adtv = pd.DataFrame(adtv_rows) if adtv_rows else pd.DataFrame()
 
-                # Preparar DataFrames
-                df_liquidez = df_liq.get("main", pd.DataFrame())
-                df_resgates = df_res
+                # main de liquidez
+                df_liquidez = df_liq.get("main", pd.DataFrame()) if isinstance(df_liq, dict) else pd.DataFrame()
+                df_resgates = df_res if isinstance(df_res, pd.DataFrame) else pd.DataFrame()
 
-                # Renomear colunas
+                # renomeia
                 df_liquidez = rename(df_liquidez)
                 df_resgates = rename(df_resgates)
-                df_adtv = rename(df_adtv) 
+                df_adtv = rename(df_adtv)
 
-                # Armazenar dados na sessão
+                # salva
                 st.session_state.df_liquidez = df_liquidez
                 st.session_state.df_resgates = df_resgates
                 st.session_state.df_adtv = df_adtv
 
-                # Armazenar listas de colunas
-                st.session_state.colunas_liquidez = sorted(df_liquidez.columns)
-                st.session_state.colunas_resgates = sorted(df_resgates.columns)
-                st.session_state.colunas_adtv = sorted(df_adtv.columns) 
+                st.session_state.colunas_liquidez = sorted(df_liquidez.columns) if not df_liquidez.empty else []
+                st.session_state.colunas_resgates = sorted(df_resgates.columns) if not df_resgates.empty else []
+                st.session_state.colunas_adtv = sorted(df_adtv.columns) if not df_adtv.empty else []
 
                 st.session_state.risco_dados_carregados = True
                 st.success("Dados carregados com sucesso.")
@@ -102,119 +157,144 @@ def mostrar_risco():
             except Exception as e:
                 st.error(f"Erro ao buscar dados: {e}")
 
-    # Seção de configuração após dados carregados
-    if st.session_state.risco_dados_carregados:
+    # -----------------------------
+    # Configuração após carregar
+    # -----------------------------
+    if not st.session_state.risco_dados_carregados:
+        return
 
-        aba = st.radio("Escolha a aba para configurar:", abas_esperadas)
+    aba = st.radio("Escolha a aba para configurar:", ABAS, key="risco_aba_config")
 
-        # Filtrar colunas disponíveis (remover repetidas)
-        colunas_disponiveis = {
-            "Liquidez": [c for c in st.session_state.colunas_liquidez if "repetido" not in c.lower()],
-            "Resgates": [c for c in st.session_state.colunas_resgates if "repetido" not in c.lower()],
-            "ADTV": [c for c in st.session_state.colunas_adtv if "repetido" not in c.lower()] if hasattr(st.session_state, 'colunas_adtv') else []
-        }
+    colunas_disponiveis = _colunas_disponiveis()
+    colunas_aba = sorted(colunas_disponiveis.get(aba, []))
 
-        prefixo_checkbox = {"Liquidez": "liq_", "Resgates": "res_", "ADTV": "adtv_"}
-        prefixo = prefixo_checkbox[aba]
-        colunas_aba = colunas_disponiveis[aba].copy()
+    prefixo_checkbox = {"Liquidez": "liq_", "Resgates": "res_", "ADTV": "adtv_"}
+    prefixo = prefixo_checkbox[aba]
 
-        # Ações rápidas
-        st.markdown("### Ações rápidas")
-        ac1, ac2, ac3 = st.columns([1, 1, 1])
-        with ac1:
-            if st.button("✅ Selecionar todas", key=f"select_all_{aba}"):
-                st.session_state.selecoes_colunas[aba] = colunas_aba.copy()
-                for col in colunas_aba:
-                    st.session_state[f"{prefixo}{col}"] = True
-                st.rerun()
-        with ac2:
-            if st.button("❌ Limpar seleção", key=f"clear_all_{aba}"):
-                st.session_state.selecoes_colunas[aba] = []
-                for col in colunas_aba:
-                    st.session_state[f"{prefixo}{col}"] = False
-                st.rerun()
-        with ac3:
-            if st.button("⭐ Favoritos", key=f"select_fav_{aba}"):
-                favoritos = st.session_state.favoritos_risco_colunas.get(aba, [])
-                st.session_state.selecoes_colunas[aba] = favoritos.copy()
-                for col in colunas_aba:
-                    st.session_state[f"{prefixo}{col}"] = col in favoritos
-                st.rerun()
+    # Ações rápidas
+    st.markdown("### Ações rápidas")
+    ac1, ac2, ac3 = st.columns([1, 1, 1])
 
-        # Botão de exportação para Excel
-        if st.button("Exportar para Excel"):
-            try:
-                portfolio_names_for_file = "_".join([get_portfolio_name(pid).replace(" ", "_") for pid in st.session_state.selected_portfolios])
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    for pid in st.session_state.selected_portfolios:
-                        nome = get_portfolio_name(pid)
-                        df_liq = st.session_state.df_liquidez[st.session_state.df_liquidez["ID Carteira"] == pid]
-                        df_res = st.session_state.df_resgates[st.session_state.df_resgates["ID Carteira"] == pid]
-                        df_adtv = st.session_state.df_adtv[st.session_state.df_adtv["ID Carteira"] == pid] if not st.session_state.df_adtv.empty else pd.DataFrame()
-                        if not df_liq.empty:
-                            colunas_liq = [c for c in st.session_state.selecoes_colunas["Liquidez"] if c in df_liq.columns]
-                            df_liq = df_liq[colunas_liq]
-                        if not df_res.empty:
-                            colunas_res = [c for c in st.session_state.selecoes_colunas["Resgates"] if c in df_res.columns]
-                            df_res = df_res[colunas_res]
-                        if not df_adtv.empty:
-                            colunas_adtv = [c for c in st.session_state.selecoes_colunas["ADTV"] if c in df_adtv.columns]
-                            df_adtv = df_adtv[colunas_adtv]
-                        format_excel_sheet_risco(writer, df_liq, df_res, df_adtv, nome)
-                st.download_button(
-                    label="📥 Baixar Excel",
-                    data=output.getvalue(),
-                    file_name=f"risco_{portfolio_names_for_file}_{data_inicio}_a_{data_fim}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            except Exception as e:
-                st.error(f"Erro ao exportar: {e}")
+    with ac1:
+        if st.button("✅ Selecionar todas", key=f"risco_select_all_{aba}"):
+            st.session_state.selecoes_colunas_risco[aba] = colunas_aba.copy()
+            for c in colunas_aba:
+                st.session_state[f"{prefixo}{c}"] = True
+            st.rerun()
 
-        st.markdown("---")
-        st.markdown("### Colunas disponíveis")
+    with ac2:
+        if st.button("❌ Limpar seleção", key=f"risco_clear_all_{aba}"):
+            st.session_state.selecoes_colunas_risco[aba] = []
+            for c in colunas_aba:
+                st.session_state[f"{prefixo}{c}"] = False
+            st.rerun()
 
-        num_colunas = 3
-        colunas_aba_filtradas = sorted(colunas_aba)
+    with ac3:
+        if st.button("⭐ Favoritos", key=f"risco_apply_fav_{aba}"):
+            favs = st.session_state.favoritos_db[TELA_ID].get(aba, [])
+            favs_ok = [c for c in favs if c in colunas_aba]
+            st.session_state.selecoes_colunas_risco[aba] = favs_ok
+            for c in colunas_aba:
+                st.session_state[f"{prefixo}{c}"] = c in favs_ok
+            st.rerun()
 
-        colunas_selecionadas_aba = []
-        favoritos_aba = []
+    # Export
+    if st.button("Exportar para Excel", key="risco_export_excel"):
+        try:
+            portfolio_names_for_file = "_".join(
+                [get_portfolio_name(pid).replace(" ", "_") for pid in st.session_state.selected_portfolios]
+            )
+            output = BytesIO()
 
-        for linha in range(0, len(colunas_aba_filtradas), num_colunas):
-            cols = st.columns(num_colunas, gap="large")
-            for i in range(num_colunas):
-                idx = linha + i
-                if idx >= len(colunas_aba_filtradas):
-                    break
-                col = colunas_aba_filtradas[idx]
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                for pid in st.session_state.selected_portfolios:
+                    nome = get_portfolio_name(pid)
+
+                    df_liq = st.session_state.df_liquidez.copy()
+                    df_res = st.session_state.df_resgates.copy()
+                    df_adtv = st.session_state.df_adtv.copy() if isinstance(st.session_state.df_adtv, pd.DataFrame) else pd.DataFrame()
+
+                    # filtra por carteira
+                    if not df_liq.empty and "ID Carteira" in df_liq.columns:
+                        df_liq = df_liq[df_liq["ID Carteira"] == pid]
+                    if not df_res.empty and "ID Carteira" in df_res.columns:
+                        df_res = df_res[df_res["ID Carteira"] == pid]
+                    if not df_adtv.empty and "ID Carteira" in df_adtv.columns:
+                        df_adtv = df_adtv[df_adtv["ID Carteira"] == pid]
+
+                    # aplica seleção de colunas
+                    if not df_liq.empty:
+                        cols = [c for c in st.session_state.selecoes_colunas_risco["Liquidez"] if c in df_liq.columns]
+                        if cols:
+                            df_liq = df_liq[cols]
+                    if not df_res.empty:
+                        cols = [c for c in st.session_state.selecoes_colunas_risco["Resgates"] if c in df_res.columns]
+                        if cols:
+                            df_res = df_res[cols]
+                    if not df_adtv.empty:
+                        cols = [c for c in st.session_state.selecoes_colunas_risco["ADTV"] if c in df_adtv.columns]
+                        if cols:
+                            df_adtv = df_adtv[cols]
+
+                    format_excel_sheet_risco(writer, df_liq, df_res, df_adtv, nome)
+
+            st.download_button(
+                label="📥 Baixar Excel",
+                data=output.getvalue(),
+                file_name=f"risco_{portfolio_names_for_file}_{data_inicio}_a_{data_fim}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"Erro ao exportar: {e}")
+
+    # -----------------------------
+    # Grid de colunas + estrela persistente
+    # -----------------------------
+    st.markdown("---")
+    st.markdown("### Colunas disponíveis")
+
+    if not colunas_aba:
+        st.info("Nenhuma coluna disponível nesta aba.")
+        return
+
+    num_colunas = 3
+    n_linhas = math.ceil(len(colunas_aba) / num_colunas)
+
+    colunas_selecionadas_aba = []
+
+    for linha in range(n_linhas):
+        cols = st.columns(num_colunas, gap="large")
+        fatia = colunas_aba[linha * num_colunas:(linha + 1) * num_colunas]
+
+        for i, col in enumerate(fatia):
+            with cols[i]:
                 key_cb = f"{prefixo}{col}"
-                key_fav = f"fav_{prefixo}{col}"
-                key_btn = f"btnfav_{prefixo}{col}"
+                row_cols = st.columns([0.85, 0.15])
 
-                # Inicialização dos favoritos
-                if key_fav not in st.session_state:
-                    st.session_state[key_fav] = col in st.session_state.favoritos_risco_colunas[aba]
+                with row_cols[0]:
+                    checked = st.checkbox(
+                        col,
+                        value=(col in st.session_state.selecoes_colunas_risco[aba]),
+                        key=key_cb,
+                    )
 
-                with cols[i]:
-                    col1, col2 = st.columns([0.85, 0.15])
-                    with col1:
-                        checked = st.checkbox(col, value=(col in st.session_state.selecoes_colunas[aba]), key=key_cb)
-                    with col2:
-                        estrela = "⭐" if st.session_state[key_fav] else "☆"
-                        if st.button(estrela, key=key_btn):
-                            st.session_state[key_fav] = not st.session_state[key_fav]
-                            if st.session_state[key_fav]:
-                                if col not in st.session_state.favoritos_risco_colunas[aba]:
-                                    st.session_state.favoritos_risco_colunas[aba].append(col)
-                            else:
-                                if col in st.session_state.favoritos_risco_colunas[aba]:
-                                    st.session_state.favoritos_risco_colunas[aba].remove(col)
+                with row_cols[1]:
+                    is_fav = col in st.session_state.favoritos_db[TELA_ID].get(aba, [])
+                    estrela = "⭐" if is_fav else "☆"
 
-                            st.rerun()
+                    if st.button(estrela, key=f"fav_{TELA_ID}_{aba}_{col}"):
+                        novo = toggle_favorito(TELA_ID, aba, col)
+
+                        # atualiza cache local
+                        st.session_state.favoritos_db[TELA_ID].setdefault(aba, [])
+                        if novo and col not in st.session_state.favoritos_db[TELA_ID][aba]:
+                            st.session_state.favoritos_db[TELA_ID][aba].append(col)
+                        if (not novo) and col in st.session_state.favoritos_db[TELA_ID][aba]:
+                            st.session_state.favoritos_db[TELA_ID][aba].remove(col)
+
+                        st.rerun()
+
                 if checked:
                     colunas_selecionadas_aba.append(col)
-                if st.session_state[key_fav]:
-                    favoritos_aba.append(col)
 
-        st.session_state.selecoes_colunas[aba] = colunas_selecionadas_aba
-        st.session_state.favoritos_risco_colunas[aba] = favoritos_aba
+    st.session_state.selecoes_colunas_risco[aba] = colunas_selecionadas_aba
