@@ -1,5 +1,6 @@
 import requests
 import streamlit as st
+import libsql_client
 from datetime import datetime, timedelta
 
 from utils import BASE_URL_API, CLIENT_ID, CLIENT_SECRET
