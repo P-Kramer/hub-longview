@@ -159,7 +159,54 @@ st.markdown(
 # TELAS
 # =========================
 def tela_login():
-    st.write("DB OK:", bool(st.secrets["TURSO"]["DATABASE_URL"]))
+    import streamlit as st
+    from libsql_client import create_client
+
+    @st.cache_resource
+    def get_db():
+        try:
+            url = st.secrets["TURSO"]["DATABASE_URL"]
+            token = st.secrets["TURSO"]["AUTH_TOKEN"]
+        except Exception as e:
+            raise RuntimeError(f"Secrets TURSO ausentes/errados: {e}")
+
+        return create_client(url=url, auth_token=token)
+
+    def check_db():
+        st.title("DB Check (Turso)")
+
+        # Não exponha token. Só mostra se as chaves existem.
+        st.write("DATABASE_URL ok:", bool(st.secrets.get("TURSO", {}).get("DATABASE_URL")))
+        st.write("AUTH_TOKEN ok:", bool(st.secrets.get("TURSO", {}).get("AUTH_TOKEN")))
+
+        db = get_db()
+
+        # 1) Ping
+        r = db.execute("SELECT 1 AS ok;").rows
+        st.success(f"Conexão ok. SELECT 1 retornou: {r}")
+
+        # 2) Schema + write/read
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS _db_check (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT (datetime('now')),
+                note TEXT
+            );
+        """)
+
+        db.execute("INSERT INTO _db_check (note) VALUES (?);", ("hello",))
+        rows = db.execute("SELECT id, created_at, note FROM _db_check ORDER BY id DESC LIMIT 5;").rows
+        st.success("Escrita/leitura ok. Últimas linhas:")
+        st.write(rows)
+
+        # 3) Cleanup (opcional)
+        db.execute("DELETE FROM _db_check WHERE note = ?;", ("hello",))
+        st.info("Cleanup feito (DELETE do note='hello').")
+
+    try:
+        check_db()
+    except Exception as e:
+        st.error(f"Falhou: {e}")
     left, center, right = st.columns([1, 2, 1])
     with center:
         st.title("Longview Hub")
@@ -208,7 +255,6 @@ def tela_login():
                 st.error(f"Erro ao autenticar: {e}")
 
 def tela_hub():
-    st.session_state.pagina_atual_carteira = "menu"
     exigir_auth()
 
     st.sidebar.image("longview.png")
