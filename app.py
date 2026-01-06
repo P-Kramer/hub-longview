@@ -113,7 +113,6 @@ APPS = [
     {"id": "carteiras",          "nome": "Carteiras",          "icone": "🗂️", "render": render_carteiras},
     {"id": "dashboard",          "nome": "Dashboard",          "icone": "📊", "render": render_dashboard},
     {"id": "compara_relatorios", "nome": "Compara Relatórios", "icone": "🧾", "render": render_compara_relatorios},
-    {"id": "transacoes",         "nome": "Transações",         "icone": "🔁", "render": 'render_transacoes'},
 ]
 
 # =========================
@@ -220,9 +219,9 @@ def tela_hub():
     st.divider()
 
     # Grid 2x2 SEM link (sem abrir nova aba)
-    col1, col2 = st.columns(2, gap="large")
-    col3, col4 = st.columns(2, gap="large")
-    slots = [col1, col2, col3, col4]
+    col1, col2, col3 = st.columns(3, gap="large")
+    
+    slots = [col1, col2, col3]
 
     for slot, app in zip(slots, APPS):
         with slot:
