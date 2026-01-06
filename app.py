@@ -6,6 +6,7 @@ from utils import BASE_URL_API, CLIENT_ID, CLIENT_SECRET
 
 from ferramentas.compara_relatorios.router import render as render_compara_relatorios
 from ferramentas.dashboard.router import render as render_dashboard
+from ferramentas.carteiras.router import render as render_carteiras
 
 
 
@@ -108,7 +109,7 @@ ctx = Ctx()
 # APPS (UI nome bonito, ID nome limpo)
 # =========================
 APPS = [
-    {"id": "carteiras",          "nome": "Carteiras",          "icone": "🗂️", "render": "render_carteiras"},
+    {"id": "carteiras",          "nome": "Carteiras",          "icone": "🗂️", "render": render_carteiras},
     {"id": "dashboard",          "nome": "Dashboard",          "icone": "📊", "render": render_dashboard},
     {"id": "compara_relatorios", "nome": "Compara Relatórios", "icone": "🧾", "render": render_compara_relatorios},
     {"id": "transacoes",         "nome": "Transações",         "icone": "🔁", "render": 'render_transacoes'},
@@ -158,6 +159,7 @@ st.markdown(
 # TELAS
 # =========================
 def tela_login():
+    st.write("DB OK:", bool(st.secrets["TURSO"]["DATABASE_URL"]))
     left, center, right = st.columns([1, 2, 1])
     with center:
         st.title("Longview Hub")
@@ -206,6 +208,7 @@ def tela_login():
                 st.error(f"Erro ao autenticar: {e}")
 
 def tela_hub():
+    st.session_state.pagina_atual_carteira = "menu"
     exigir_auth()
 
     st.sidebar.image("longview.png")

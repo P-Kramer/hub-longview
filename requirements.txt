@@ -16,3 +16,5 @@ pymupdf
 openpyxl
 plotly
 Pillow
+gspread
+libsql-client
