@@ -1,4 +1,4 @@
-def checar_divergencias(df_at, df_cd):
+def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
     import pandas as pd
     import numpy as np
     from rapidfuzz import fuzz, process
@@ -102,16 +102,61 @@ def checar_divergencias(df_at, df_cd):
         match = re.search(r"US([A-Z0-9]{9})", str(texto).upper())
         return match.group(1) if match else None
 
+    def _ensure_cols(df, cols_defaults: dict):
+        """Garante colunas; se não existir, cria com default."""
+        df = df.copy()
+        for c, default in cols_defaults.items():
+            if c not in df.columns:
+                df[c] = default
+        return df
+
     def processar_com_dinheiro(df):
-        df = df[(df["Classe"].isin(["EQUITY", "FIXED INCOME", "FLOATING INCOME"]))].copy()
+        df = df.copy()
+
+        df = _ensure_cols(
+            df,
+            {
+                "Classe": None,
+                "Ativo": "",
+                "Quant.": np.nan,
+                "Saldo Bruto": np.nan,
+                "ticker_cmd_puro": "",
+                "Descrição": "",
+            },
+        )
+
+        df = df[df["Classe"].isin(["EQUITY", "FIXED INCOME", "FLOATING INCOME", "HEDGE FUND"])].copy()
         df = df.rename(columns={"Ativo": "Ticker", "Quant.": "Quantidade", "Saldo Bruto": "MarketValue"})
-        df["TickerBase"] = df["ticker_cmd_puro"].str.split(":").str[-1].str.strip()
+
+        # ticker_cmd_puro pode não existir / vir vazio -> TickerBase vazio
+        df["TickerBase"] = df["ticker_cmd_puro"].astype(str).str.split(":").str[-1].str.strip()
+
         return df[["Descrição", "Ticker", "TickerBase", "Quantidade", "MarketValue", "Classe"]]
 
     def processar_ativos(df):
+        df = df.copy()
+        df = _ensure_cols(
+            df,
+            {
+                "Ativo": "",
+                "Ticker": "",
+                "Quantidade Total": np.nan,
+                "Market Value": np.nan,
+                "CUSIP": "",
+            },
+        )
+
         df = df.rename(columns={"Ativo": "Nome", "Quantidade Total": "Quantidade", "Market Value": "MarketValue"})
-        df["TickerBase"] = df["Ticker"].str.extract(r"([A-Z]{2,6}$)")[0].fillna(df["Ticker"])
-        return df[["Nome", "Ticker", "TickerBase", "Quantidade", "MarketValue", "CUSIP"]]
+        df["Ticker"] = df["Ticker"].fillna("").astype(str)
+        df["CUSIP"] = df["CUSIP"].fillna("").astype(str)
+
+        # TickerBase pode ficar vazio (ok)
+        df["TickerBase"] = df["Ticker"].str.extract(r"([A-Z]{2,6}$)")[0].fillna(df["Ticker"]).fillna("")
+
+        # rowid para nunca sumir no "Só ATIVOS"
+        df["__rowid_at"] = range(len(df))
+
+        return df[["__rowid_at", "Nome", "Ticker", "TickerBase", "Quantidade", "MarketValue", "CUSIP"]]
 
     equity_cd = processar_com_dinheiro(df_cd)
     equity_at = processar_ativos(df_at)
@@ -119,15 +164,19 @@ def checar_divergencias(df_at, df_cd):
     # ========= 1) pareamentos forçados CUSIP->descrição =========
     pareamentos_cusip_descricao_forcados = {"J7596PAJ8": "SOFTBANK GROUP 17/UND. 6,875%"}
     forced_cusip_desc_matches = []
-    for _, row_at in equity_at.iterrows():
+
+    # iterrows sobre cópia para evitar confusão ao dropar
+    for idx_at, row_at in equity_at.copy().iterrows():
         cusip_at = row_at["CUSIP"]
-        if pd.notna(cusip_at) and cusip_at in pareamentos_cusip_descricao_forcados:
+        if pd.notna(cusip_at) and str(cusip_at).strip() != "" and cusip_at in pareamentos_cusip_descricao_forcados:
             descricao_alvo = pareamentos_cusip_descricao_forcados[cusip_at]
-            match_cd = equity_cd[equity_cd["Descrição"].str.contains(descricao_alvo, case=False, na=False)]
+            match_cd = equity_cd[equity_cd["Descrição"].astype(str).str.contains(descricao_alvo, case=False, na=False)]
             if not match_cd.empty:
-                row_cd = match_cd.iloc[0]
+                idx_cd = match_cd.index[0]
+                row_cd = match_cd.loc[idx_cd]
                 forced_cusip_desc_matches.append(
                     {
+                        "__rowid_at": row_at["__rowid_at"],
                         "Descrição_CD": row_cd["Descrição"],
                         "Ticker_CD": row_cd["Ticker"],
                         "TickerBase": row_cd["TickerBase"],
@@ -142,24 +191,37 @@ def checar_divergencias(df_at, df_cd):
                         "Similaridade": 100,
                     }
                 )
-                equity_cd = equity_cd.drop(row_cd.name)
-                equity_at = equity_at.drop(row_at.name)
+                equity_cd = equity_cd.drop(index=idx_cd)
+                equity_at = equity_at.drop(index=idx_at)
 
     # ========= 2) pareamento por CUSIP (extraído do ticker CD) =========
-    equity_cd["CUSIP_EXTRAIDO"] = equity_cd["Ticker"].apply(extrair_cusip)
-    equity_at["CUSIP"].replace(["", " ", "  "], pd.NA, inplace=True)
+    equity_cd = equity_cd.copy()
+    equity_at = equity_at.copy()
 
-    cd_com_cusip = equity_cd.dropna(subset=["CUSIP_EXTRAIDO"])
-    at_com_cusip = equity_at.dropna(subset=["CUSIP"])
-    cd_sem_cusip = equity_cd[equity_cd["CUSIP_EXTRAIDO"].isna()]
-    at_sem_cusip = equity_at[equity_at["CUSIP"].isna()]
+    equity_cd["CUSIP_EXTRAIDO"] = equity_cd["Ticker"].apply(extrair_cusip)
+
+    # limpa CUSIP vazio
+    equity_at["CUSIP"] = equity_at["CUSIP"].replace(["", " ", "  "], pd.NA)
+
+    cd_com_cusip = equity_cd.dropna(subset=["CUSIP_EXTRAIDO"]).copy()
+    at_com_cusip = equity_at.dropna(subset=["CUSIP"]).copy()
+    cd_sem_cusip = equity_cd[equity_cd["CUSIP_EXTRAIDO"].isna()].copy()
+    at_sem_cusip = equity_at[equity_at["CUSIP"].isna()].copy()
 
     cusip_matches = []
-    for _, row_cd in cd_com_cusip.iterrows():
-        for _, row_at in at_com_cusip.iterrows():
-            if row_at["CUSIP"] in row_cd["Ticker"]:
+    used_cd_idx = set()
+    used_at_idx = set()
+
+    for idx_cd, row_cd in cd_com_cusip.iterrows():
+        ticker_cd = str(row_cd.get("Ticker", "") or "")
+        for idx_at, row_at in at_com_cusip.iterrows():
+            if idx_at in used_at_idx:
+                continue
+            cusip_at = str(row_at.get("CUSIP", "") or "")
+            if cusip_at and cusip_at in ticker_cd:
                 cusip_matches.append(
                     {
+                        "__rowid_at": row_at["__rowid_at"],
                         "Descrição_CD": row_cd["Descrição"],
                         "Ticker_CD": row_cd["Ticker"],
                         "TickerBase": row_cd["TickerBase"],
@@ -174,18 +236,33 @@ def checar_divergencias(df_at, df_cd):
                         "Similaridade": 100,
                     }
                 )
+                used_cd_idx.add(idx_cd)
+                used_at_idx.add(idx_at)
                 break
 
     cusip_df = pd.DataFrame(cusip_matches)
 
-    # segue sem CUSIP
-    equity_cd = cd_sem_cusip
-    equity_at = at_sem_cusip
+    # IMPORTANTÍSSIMO: NÃO DESCARTA "com cusip" que não pareou
+    cd_com_cusip_restante = cd_com_cusip.drop(index=list(used_cd_idx), errors="ignore")
+    at_com_cusip_restante = at_com_cusip.drop(index=list(used_at_idx), errors="ignore")
+
+    equity_cd = pd.concat([cd_sem_cusip, cd_com_cusip_restante.drop(columns=["CUSIP_EXTRAIDO"], errors="ignore")], ignore_index=True)
+    equity_at = pd.concat([at_sem_cusip, at_com_cusip_restante], ignore_index=True)
 
     # ========= 3) match exato por TickerBase =========
-    exact_match = pd.merge(equity_cd, equity_at, on="TickerBase", suffixes=("_CD", "_MS"), how="inner")
+    # só faz inner se existir TickerBase nos dois e não vazio
+    eq_cd_tb = equity_cd.copy()
+    eq_at_tb = equity_at.copy()
+
+    # evita casar "" com "" (isso é cagada)
+    eq_cd_tb = eq_cd_tb[eq_cd_tb["TickerBase"].astype(str).str.strip() != ""]
+    eq_at_tb = eq_at_tb[eq_at_tb["TickerBase"].astype(str).str.strip() != ""]
+
+    exact_match = pd.merge(eq_cd_tb, eq_at_tb, on="TickerBase", suffixes=("_CD", "_MS"), how="inner")
+
     exact_matches_list = [
         {
+            "__rowid_at": r["__rowid_at"],
             "Descrição_CD": r["Descrição"],
             "Ticker_CD": r["Ticker_CD"],
             "TickerBase": r["TickerBase"],
@@ -202,21 +279,27 @@ def checar_divergencias(df_at, df_cd):
         for _, r in exact_match.iterrows()
     ]
 
-    matched_tickers = exact_match["TickerBase"].unique()
-    remaining_cd = equity_cd[~equity_cd["TickerBase"].isin(matched_tickers)]
-    remaining_at = equity_at[~equity_at["TickerBase"].isin(matched_tickers)]
+    matched_tickers = exact_match["TickerBase"].unique() if not exact_match.empty else []
+    remaining_cd = equity_cd[~equity_cd["TickerBase"].isin(matched_tickers)].copy()
+    remaining_at = equity_at[~equity_at["TickerBase"].isin(matched_tickers)].copy()
 
     # ========= 4) forçados por descrição->ticker =========
     forcados = []
-    for _, row in remaining_cd.iterrows():
-        descricao_upper = str(row["Descrição"]).strip().upper()
+    used_rowid_at = set([d.get("__rowid_at") for d in exact_matches_list if d.get("__rowid_at") is not None])
+
+    for idx_cd, row in remaining_cd.iterrows():
+        descricao_upper = str(row.get("Descrição", "") or "").strip().upper()
         if descricao_upper in pareamentos_forcados:
             ticker_alvo = pareamentos_forcados[descricao_upper]
             match_row = remaining_at[remaining_at["Ticker"] == ticker_alvo]
             if not match_row.empty:
                 m = match_row.iloc[0]
+                if m["__rowid_at"] in used_rowid_at:
+                    continue
+                used_rowid_at.add(m["__rowid_at"])
                 forcados.append(
                     {
+                        "__rowid_at": m["__rowid_at"],
                         "Descrição_CD": row["Descrição"],
                         "Ticker_CD": row["Ticker"],
                         "TickerBase": row["TickerBase"],
@@ -234,15 +317,24 @@ def checar_divergencias(df_at, df_cd):
 
     # ========= 5) fuzzy por descrição =========
     fuzzy_matches = []
-    if not remaining_at.empty:
+    if not remaining_at.empty and not remaining_cd.empty:
+        candidatos = remaining_at["Nome"].astype(str).tolist()
         for _, row in remaining_cd.iterrows():
-            match, score, _ = process.extractOne(
-                row["Descrição"], remaining_at["Nome"].tolist(), scorer=fuzz.token_set_ratio
-            )
+            desc = str(row.get("Descrição", "") or "")
+            if not candidatos:
+                break
+            out = process.extractOne(desc, candidatos, scorer=fuzz.token_set_ratio)
+            if not out:
+                continue
+            match_nome, score, _ = out
             if score >= 85:
-                m = remaining_at[remaining_at["Nome"] == match].iloc[0]
+                m = remaining_at[remaining_at["Nome"] == match_nome].iloc[0]
+                if m["__rowid_at"] in used_rowid_at:
+                    continue
+                used_rowid_at.add(m["__rowid_at"])
                 fuzzy_matches.append(
                     {
+                        "__rowid_at": m["__rowid_at"],
                         "Descrição_CD": row["Descrição"],
                         "Ticker_CD": row["Ticker"],
                         "TickerBase": row["TickerBase"],
@@ -269,72 +361,93 @@ def checar_divergencias(df_at, df_cd):
     )
 
     # ========= 6) ticker direto e “primeira palavra” =========
-    matched_bases = all_matches["TickerBase"].unique() if not all_matches.empty else []
-    extra_cd = equity_cd[~equity_cd["TickerBase"].isin(matched_bases)]
-    extra_at = equity_at[~equity_at["TickerBase"].isin(matched_bases)]
+    matched_rowids = set(all_matches["__rowid_at"].dropna().astype(int).tolist()) if not all_matches.empty else set()
+
+    # NÃO usa só TickerBase, usa sobras por rowid também
+    extra_cd = remaining_cd.copy()
+    extra_at = remaining_at[~remaining_at["__rowid_at"].isin(matched_rowids)].copy()
 
     ticker_matches = []
-    for _, row_cd in extra_cd.iterrows():
-        mr = extra_at[extra_at["Ticker"] == row_cd["TickerBase"]]
-        if not mr.empty:
-            m = mr.iloc[0]
-            ticker_matches.append(
-                {
-                    "Descrição_CD": row_cd["Descrição"],
-                    "Ticker_CD": row_cd["Ticker"],
-                    "TickerBase": row_cd["TickerBase"],
-                    "Classe": row_cd["Classe"],
-                    "Quantidade_CD": row_cd["Quantidade"],
-                    "MarketValue_CD": row_cd["MarketValue"],
-                    "Nome_MS": m["Nome"],
-                    "Ticker_MS": m["Ticker"],
-                    "Quantidade_MS": m["Quantidade"],
-                    "CUSIP_MS": m["CUSIP"],
-                    "MarketValue_MS": m["MarketValue"],
-                    "Similaridade": 100,
-                }
-            )
-
-    cd_restante = extra_cd[~extra_cd["TickerBase"].isin([m["TickerBase"] for m in ticker_matches])]
-    at_restante = extra_at[~extra_at["TickerBase"].isin([m["TickerBase"] for m in ticker_matches])]
+    if not extra_cd.empty and not extra_at.empty:
+        for _, row_cd in extra_cd.iterrows():
+            tb = str(row_cd.get("TickerBase", "") or "").strip()
+            if tb == "":
+                continue
+            mr = extra_at[extra_at["Ticker"] == tb]
+            if not mr.empty:
+                m = mr.iloc[0]
+                if m["__rowid_at"] in matched_rowids:
+                    continue
+                matched_rowids.add(m["__rowid_at"])
+                ticker_matches.append(
+                    {
+                        "__rowid_at": m["__rowid_at"],
+                        "Descrição_CD": row_cd["Descrição"],
+                        "Ticker_CD": row_cd["Ticker"],
+                        "TickerBase": row_cd["TickerBase"],
+                        "Classe": row_cd["Classe"],
+                        "Quantidade_CD": row_cd["Quantidade"],
+                        "MarketValue_CD": row_cd["MarketValue"],
+                        "Nome_MS": m["Nome"],
+                        "Ticker_MS": m["Ticker"],
+                        "Quantidade_MS": m["Quantidade"],
+                        "CUSIP_MS": m["CUSIP"],
+                        "MarketValue_MS": m["MarketValue"],
+                        "Similaridade": 100,
+                    }
+                )
 
     palavra_matches = []
-    if not at_restante.empty:
+    cd_restante = extra_cd.copy()
+    at_restante = extra_at[~extra_at["__rowid_at"].isin(matched_rowids)].copy()
+
+    if not at_restante.empty and not cd_restante.empty:
+        candidatos = at_restante["Nome"].astype(str).tolist()
         for _, row_cd in cd_restante.iterrows():
-            palavra_cd = str(row_cd["Descrição"]).strip().split()[0].upper()
-            candidatos = at_restante["Nome"].tolist()
-            melhores = process.extract(palavra_cd, candidatos, scorer=fuzz.token_sort_ratio, limit=1)
-            if melhores:
-                match, score, _ = melhores[0]
-                if score >= 80:
-                    m = at_restante[at_restante["Nome"] == match].iloc[0]
-                    palavra_matches.append(
-                        {
-                            "Descrição_CD": row_cd["Descrição"],
-                            "Ticker_CD": row_cd["Ticker"],
-                            "TickerBase": row_cd["TickerBase"],
-                            "Classe": row_cd["Classe"],
-                            "Quantidade_CD": row_cd["Quantidade"],
-                            "MarketValue_CD": row_cd["MarketValue"],
-                            "Nome_MS": m["Nome"],
-                            "Ticker_MS": m["Ticker"],
-                            "Quantidade_MS": m["Quantidade"],
-                            "CUSIP_MS": m["CUSIP"],
-                            "MarketValue_MS": m["MarketValue"],
-                            "Similaridade": score,
-                        }
-                    )
+            desc_cd = str(row_cd.get("Descrição", "") or "").strip()
+            if not desc_cd:
+                continue
+            palavra_cd = desc_cd.split()[0].upper()
+            out = process.extractOne(palavra_cd, candidatos, scorer=fuzz.token_sort_ratio)
+            if not out:
+                continue
+            match_nome, score, _ = out
+            if score >= 80:
+                m = at_restante[at_restante["Nome"] == match_nome].iloc[0]
+                if m["__rowid_at"] in matched_rowids:
+                    continue
+                matched_rowids.add(m["__rowid_at"])
+                palavra_matches.append(
+                    {
+                        "__rowid_at": m["__rowid_at"],
+                        "Descrição_CD": row_cd["Descrição"],
+                        "Ticker_CD": row_cd["Ticker"],
+                        "TickerBase": row_cd["TickerBase"],
+                        "Classe": row_cd["Classe"],
+                        "Quantidade_CD": row_cd["Quantidade"],
+                        "MarketValue_CD": row_cd["MarketValue"],
+                        "Nome_MS": m["Nome"],
+                        "Ticker_MS": m["Ticker"],
+                        "Quantidade_MS": m["Quantidade"],
+                        "CUSIP_MS": m["CUSIP"],
+                        "MarketValue_MS": m["MarketValue"],
+                        "Similaridade": score,
+                    }
+                )
 
     extra_df = pd.DataFrame(ticker_matches + palavra_matches)
     if not extra_df.empty:
         all_matches = pd.concat([all_matches, extra_df], ignore_index=True)
 
     # ========= não pareados (pré-varredura quantidade) =========
-    tickersbase_usados_cd = all_matches["TickerBase"].unique() if not all_matches.empty else []
-    tickers_usados_at = all_matches["Ticker_MS"].unique() if not all_matches.empty else []
+    used_rowids_final = set(all_matches["__rowid_at"].dropna().astype(int).tolist()) if not all_matches.empty else set()
 
+    # CD ainda é por TickerBase (ok)
+    tickersbase_usados_cd = all_matches["TickerBase"].dropna().unique().tolist() if not all_matches.empty else []
     non_matched_cd = equity_cd[~equity_cd["TickerBase"].isin(tickersbase_usados_cd)].copy()
-    non_matched_at = equity_at[~equity_at["Ticker"].isin(tickers_usados_at)].copy()
+
+    # ATIVOS: por rowid (NUNCA SOME)
+    non_matched_at = equity_at[~equity_at["__rowid_at"].isin(used_rowids_final)].copy()
 
     # ==========================================================
     # PASSO EXTRA: varredura por QUANTIDADE (após parear tudo)
@@ -349,16 +462,16 @@ def checar_divergencias(df_at, df_cd):
             continue
         at_by_qty.setdefault(q, []).append((idx_at, row_at))
 
-    used_cd_idx = set()
-    used_at_idx = set()
+    used_cd_idx2 = set()
+    used_at_idx2 = set()
     qty_matches = []
 
     for idx_cd, row_cd in non_matched_cd.iterrows():
         q = row_cd["Quantidade_num"]
-        if pd.isna(q) or idx_cd in used_cd_idx:
+        if pd.isna(q) or idx_cd in used_cd_idx2:
             continue
 
-        candidatos = [(i, r) for (i, r) in at_by_qty.get(q, []) if i not in used_at_idx]
+        candidatos = [(i, r) for (i, r) in at_by_qty.get(q, []) if i not in used_at_idx2]
         if not candidatos:
             continue
 
@@ -366,6 +479,7 @@ def checar_divergencias(df_at, df_cd):
             idx_at, m = candidatos[0]
             qty_matches.append(
                 {
+                    "__rowid_at": m["__rowid_at"],
                     "Descrição_CD": row_cd["Descrição"],
                     "Ticker_CD": row_cd["Ticker"],
                     "TickerBase": row_cd["TickerBase"],
@@ -377,14 +491,13 @@ def checar_divergencias(df_at, df_cd):
                     "Quantidade_MS": m["Quantidade"],
                     "CUSIP_MS": m["CUSIP"],
                     "MarketValue_MS": m["MarketValue"],
-                    "Similaridade": 60,  # marca como pareamento fraco por quantidade
+                    "Similaridade": 60,
                 }
             )
-            used_cd_idx.add(idx_cd)
-            used_at_idx.add(idx_at)
+            used_cd_idx2.add(idx_cd)
+            used_at_idx2.add(idx_at)
             continue
 
-        # múltiplos: desempate por similaridade (aceita só se bem claro)
         desc = str(row_cd.get("Descrição", "") or "")
         best = None
         best_score = -1
@@ -404,6 +517,7 @@ def checar_divergencias(df_at, df_cd):
             idx_at, m = best
             qty_matches.append(
                 {
+                    "__rowid_at": m["__rowid_at"],
                     "Descrição_CD": row_cd["Descrição"],
                     "Ticker_CD": row_cd["Ticker"],
                     "TickerBase": row_cd["TickerBase"],
@@ -418,14 +532,14 @@ def checar_divergencias(df_at, df_cd):
                     "Similaridade": best_score,
                 }
             )
-            used_cd_idx.add(idx_cd)
-            used_at_idx.add(idx_at)
+            used_cd_idx2.add(idx_cd)
+            used_at_idx2.add(idx_at)
 
     qty_df = pd.DataFrame(qty_matches)
     if not qty_df.empty:
         all_matches = pd.concat([all_matches, qty_df], ignore_index=True)
-        non_matched_cd = non_matched_cd.drop(index=list(used_cd_idx), errors="ignore")
-        non_matched_at = non_matched_at.drop(index=list(used_at_idx), errors="ignore")
+        non_matched_cd = non_matched_cd.drop(index=list(used_cd_idx2), errors="ignore")
+        non_matched_at = non_matched_at.drop(index=list(used_at_idx2), errors="ignore")
 
     non_matched_cd.drop(columns=["Quantidade_num"], inplace=True, errors="ignore")
     non_matched_at.drop(columns=["Quantidade_num"], inplace=True, errors="ignore")
@@ -433,10 +547,8 @@ def checar_divergencias(df_at, df_cd):
 
     # ==========================================================
     # RECALCULAR DIFERENÇAS / PREÇO / % PARA TODO all_matches
-    # (inclui os pareados por quantidade)
     # ==========================================================
     if not all_matches.empty:
-        # garante numéricos
         all_matches["Quantidade_CD_num"] = all_matches["Quantidade_CD"].apply(_to_float)
         all_matches["Quantidade_MS_num"] = all_matches["Quantidade_MS"].apply(_to_float)
         all_matches["MarketValue_CD_num"] = all_matches["MarketValue_CD"].apply(_to_float)
@@ -459,9 +571,8 @@ def checar_divergencias(df_at, df_cd):
         all_matches["Pct_Diff_MarketValue"] = all_matches["Diff_MarketValue"] / mv_ms.replace(0, np.nan)
         all_matches["Pct_Diff_PrecoUnitario"] = all_matches["Diff_PrecoUnitario"] / all_matches["PrecoUnitario_MS"].replace(0, np.nan)
 
-        # regra de destaque (você já usa por classe, vou manter isso)
         all_matches["Destaque"] = False
-        # cleanup auxiliares numéricas
+
         all_matches.drop(
             columns=["Quantidade_CD_num", "Quantidade_MS_num", "MarketValue_CD_num", "MarketValue_MS_num"],
             inplace=True,
@@ -470,11 +581,11 @@ def checar_divergencias(df_at, df_cd):
 
     # ========= consolidados =========
     non_matched_consolidado = pd.concat(
-        [non_matched_cd.assign(Origem="COM DINHEIRO"), non_matched_at.assign(Origem="ATIVOS")],
+        [non_matched_cd.assign(Origem="COM DINHEIRO"), non_matched_at.assign(Origem="MS")],
         ignore_index=True,
     )
 
-    # ordem final de colunas (mantive seu padrão)
+    # ordem final de colunas
     col_order = [
         "TickerBase",
         "Ticker_MS",
@@ -519,11 +630,11 @@ def checar_divergencias(df_at, df_cd):
     for r in dataframe_to_rows(non_matched_cd, index=False, header=True):
         ws_so_cd.append(r)
 
-    ws_so_at = wb.create_sheet("Só ATIVOS")
+    ws_so_at = wb.create_sheet("Só MS")
     for r in dataframe_to_rows(non_matched_at, index=False, header=True):
         ws_so_at.append(r)
 
-    # ========= destaque amarelo (agora já inclui os pareados por quantidade) =========
+    # ========= destaque amarelo =========
     if not all_matches.empty:
         diff_mv_col = col_order.index("Diff_MarketValue") + 1
         pct_diff_mv_col = col_order.index("Pct_Diff_MarketValue") + 1
@@ -534,10 +645,13 @@ def checar_divergencias(df_at, df_cd):
             pct_diff_mv = ws_pareados.cell(row=idx, column=pct_diff_mv_col).value
             classe = ws_pareados.cell(row=idx, column=classe_col).value
 
-            if classe == "EQUITY":
-                destacar = (diff_mv is not None) and (abs(float(diff_mv)) > 1)
-            else:
-                destacar = (pct_diff_mv is not None) and (abs(float(pct_diff_mv)) > 0.01)
+            try:
+                if classe == "EQUITY":
+                    destacar = (diff_mv is not None) and (abs(float(diff_mv)) > diff_mv_max)
+                else:
+                    destacar = (pct_diff_mv is not None) and (abs(float(pct_diff_mv)) > diff_pct_max)
+            except Exception:
+                destacar = False
 
             if destacar:
                 for cell in row:

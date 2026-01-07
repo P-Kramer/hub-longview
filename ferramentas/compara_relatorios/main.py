@@ -91,10 +91,41 @@ def processar_pdf (pdf_bytes , return_excel=False):
                                     break
                 # Detecta novo ativo válido
                 if is_bold(span) and "(" in texto and ")" in texto:
-                    if any(palavra in texto for palavra in ["$", "/", "(MMF)", "(NL)", ",", "Approved List", "Focus List", "Investment Objectives", "Asset Class"]):
+                    texto_limpo = texto.strip()
+
+
+                    # descarta se tiver 2+ vírgulas OU se tiver ponto-e-vírgula
+                    if texto_limpo.count(",") >= 2:
+                        idx += 1
+                        continue
+                    if "." in texto_limpo and "," in texto_limpo:
                         idx += 1
                         continue
 
+                    # (opcional) descarta se tiver ":" (muito comum em linha explicativa)
+                    # if ":" in texto_limpo:
+                    #     idx += 1
+                    #     continue
+
+                    if any(palavra in texto_limpo for palavra in ["$", "/", "(MMF)", "(NL)", "Approved List", "Focus List", "Investment Objectives", "Asset Class", "Status Changes", "ICAP-AAA"]):
+                        idx += 1
+                        continue
+                    if "KKRT" in texto_limpo:
+                        qnt = spans[idx + 4]["text"].strip()
+                        mv = spans[idx + 10]["text"].strip()
+                        mv = mv.replace ("$","")
+                        quantidade = float(qnt.replace(",", ""))  
+                        market_value = float(mv.replace(",", ""))
+
+                        dados.append({
+                         "Página": i + 1,
+                         "Ativo": "KKR & CO INC 6.875% SER T (KKRT)",
+                         "Ticker": "KKRT",
+                         "CUSIP": "",
+                         "Quantidade Total": quantidade,
+                         "Total Cost": "",
+                         "Market Value": market_value
+                                    })
                     # Se havia ativo anterior sem total, tenta pegar última linha válida com números
                     if ativo_atual and not total_extraido and linhas_ativas:
                         c= 0

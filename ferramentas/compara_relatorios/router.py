@@ -30,6 +30,9 @@ def render(ctx=None):
         st.caption("Colunas necessárias: Carteira, Ativo, Descrição, Quant., Saldo Bruto, Classe, ticker_cmd_puro")
 
     st.divider()
+    st.subheader("Critérios de Divergências")
+    diff_mv_max = st.number_input("Máxima diferença em MarketValue entre Equities ($)", min_value=0, max_value=10000000000000, step=1)
+    diff_pct_max = st.number_input("Máxima diferença percentual de MarketValue entre não Equities (%)", min_value=0.00, max_value=100.00, step=1/100)
 
     if st.button("🔍 Iniciar Comparação", use_container_width=True) and pdf_file and excel_file:
         with st.spinner("⏳ Processando arquivos..."):
@@ -67,7 +70,7 @@ def render(ctx=None):
                     st.caption(f"Linhas: {len(df_cd)} | Colunas: {len(df_cd.columns)}")
 
                 # 3) Comparação
-                df_diferencas, report_buffer = checar_divergencias(df_ativos, df_cd)
+                df_diferencas, report_buffer = checar_divergencias(df_ativos, df_cd, diff_pct_max/100, diff_mv_max)
 
                 if not df_diferencas.empty:
                     st.success("✅ Comparação concluída. Divergências encontradas.")
