@@ -18,3 +18,4 @@ plotly
 Pillow
 gspread
 libsql
+xlrd
