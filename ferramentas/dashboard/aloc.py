@@ -8,12 +8,67 @@ from utils import BASE_URL_API, CARTEIRAS
 # ===== Configs =====
 PIZZA_LIMIAR_OUTROS = 0.02  # classes com <2% vão para "Outros"
 
+INSTRUMENT_TYPE_MAP = {
+    1: "stock",
+    2: "etf",
+    3: "fund",
+    7: "currency",
+    9: "future",
+    10: "option",
+    11: "swap",
+    12: "cfd",
+}
 
+CURRENCY_ID_MAP = {
+    1: "BRL",
+    2: "USD",
+    3: "EUR",
+    4: "GBP",
+}
+
+# =========================
+# Helpers
+# =========================
+def _to_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return default
+
+
+def _fmt_brl(v: float) -> str:
+    try:
+        return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "0,00"
+
+
+def _pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _contains_any(series: pd.Series, words: list[str]) -> pd.Series:
+    mask = pd.Series(False, index=series.index)
+    for w in words:
+        mask = mask | series.str.contains(w, na=False)
+    return mask
+
+
+# =========================
+# Pizza
+# =========================
 def _consolidar_outros(agg: pd.DataFrame, limiar: float = PIZZA_LIMIAR_OUTROS) -> pd.DataFrame:
-    """Agrupa classes pequenas em 'Outros' com base no percentual."""
+    if agg.empty:
+        return agg
+
     if "pct" not in agg.columns:
-        total = agg["asset_value"].sum()
-        agg = agg.assign(pct=agg["asset_value"] / total if total else 0)
+        total = float(agg["asset_value"].sum())
+        agg = agg.assign(pct=(agg["asset_value"] / total) if total else 0.0)
 
     grandes = agg[agg["pct"] >= limiar].copy()
     pequenos = agg[agg["pct"] < limiar].copy()
@@ -21,22 +76,42 @@ def _consolidar_outros(agg: pd.DataFrame, limiar: float = PIZZA_LIMIAR_OUTROS) -
     if pequenos.empty:
         return grandes.sort_values("asset_value", ascending=False).reset_index(drop=True)
 
+    total_all = float(agg["asset_value"].sum())
+    outros_val = float(pequenos["asset_value"].sum())
+
     outros = pd.DataFrame({
         "book_name": ["Outros"],
-        "asset_value": [pequenos["asset_value"].sum()],
-        "pct": [pequenos["asset_value"].sum() / agg["asset_value"].sum() if agg["asset_value"].sum() else 0]
+        "asset_value": [outros_val],
+        "pct": [(outros_val / total_all) if total_all else 0.0],
     })
 
     res = pd.concat([grandes, outros], ignore_index=True)
     return res.sort_values("asset_value", ascending=False).reset_index(drop=True)
 
 
-def _fig_pizza(agg: pd.DataFrame):
-    """Donut chart com percentuais em NEGRITO e hover em pt-BR."""
-    import plotly.graph_objects as go
+def _color_map_for_pie(agg: pd.DataFrame):
+    palette = [
+        "#1F77B4","#2CA02C","#FF7F0E","#9467BD","#17BECF",
+        "#D62728","#8C564B","#BCBD22","#E377C2","#7F7F7F",
+        "#0B4F6C","#14532D","#B45309","#4C1D95","#0F766E",
+    ]
+    tmp = agg.copy().sort_values("asset_value", ascending=False).reset_index(drop=True)
+    color_by_label, i = {}, 0
+    for _, row in tmp.iterrows():
+        lab = str(row["book_name"])
+        if lab.strip().lower() == "outros":
+            color_by_label[lab] = "#9CA3AF"
+        else:
+            color_by_label[lab] = palette[i % len(palette)]
+            i += 1
+    return [color_by_label[str(l)] for l in agg["book_name"].tolist()]
 
+
+def _fig_pizza(agg: pd.DataFrame):
+    import plotly.graph_objects as go
     labels = agg["book_name"].tolist()
     values = agg["asset_value"].tolist()
+    colors = _color_map_for_pie(agg)
 
     fig = go.Figure(
         data=[go.Pie(
@@ -45,35 +120,135 @@ def _fig_pizza(agg: pd.DataFrame):
             hole=0.55,
             sort=False,
             direction="clockwise",
-            # Exibir somente a % no rótulo, em NEGRITO via texttemplate
+            marker=dict(colors=colors, line=dict(color="white", width=2)),
             texttemplate="<b>%{percent}</b>",
             textinfo="percent",
             textposition="inside",
-            textfont=dict(size=14, family="Arial, DejaVu Sans, sans-serif"),
-            insidetextfont=dict(size=14, family="Arial, DejaVu Sans, sans-serif"),
+            textfont=dict(size=14, family="Arial, DejaVu Sans, sans-serif", color="white"),
             hovertemplate="<b>%{label}</b><br>Financeiro: R$ %{value:,.2f}<br>% Alocado: %{percent}<extra></extra>",
             showlegend=True
         )]
     )
-
     fig.update_layout(
         template="plotly_white",
         margin=dict(t=20, b=20, l=20, r=20),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=-0.15,
-            xanchor="center",
-            x=0.5,
-            font=dict(size=12)
-        ),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5, font=dict(size=12)),
         height=600,
-        uniformtext_minsize=12,
-        uniformtext_mode="show",
     )
     return fig
 
 
+# =========================
+# Métricas (API-only)
+# =========================
+def _calcular_metricas_gestao(overview: dict, df_positions: pd.DataFrame) -> dict:
+    df = df_positions.copy()
+
+    # PL e enquadramento oficial
+    PL = _to_float(overview.get("net_asset_value", 0))
+    equity_exposure = _to_float(overview.get("equity_exposure", 0))
+    enquadramento_rv = (equity_exposure / PL * 100) if PL else 0.0
+
+    # valor com sinal (obrigatório para líquido/hedge)
+    value_col = _pick_first_existing(df, ["exposure_value", "last_exposure_value"])
+    if value_col is None:
+        # fallback: vai rodar, mas líquido/hedge fica menos confiável
+        value_col = _pick_first_existing(df, ["financial_value", "market_value", "asset_value"])
+
+    if value_col is None:
+        return {"_erro": "Sem coluna de valor (exposure_value/asset_value/etc).", "PL": PL}
+
+    df["val"] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
+
+    # moeda
+    currency_id_col = _pick_first_existing(df, ["original_currency_id", "currency_id", "instrument_currency_id"])
+    if currency_id_col is not None:
+        df["currency"] = df[currency_id_col].map(CURRENCY_ID_MAP).fillna(df[currency_id_col].astype(str))
+    else:
+        df["currency"] = "BRL"
+
+    # instrument_type
+    if "instrument_type" in df.columns:
+        df["type_l"] = df["instrument_type"].map(INSTRUMENT_TYPE_MAP).fillna(df["instrument_type"].astype(str)).astype(str).str.lower()
+    else:
+        df["type_l"] = "unknown"
+
+    is_deriv = df["type_l"].isin(["future", "option", "swap", "cfd", "currency"])
+
+    # textos
+    df["book_l"] = df.get("book_name", "").astype(str).str.lower()
+    df["name_l"] = df.get("instrument_name", "").astype(str).str.lower()
+    df["cc_l"] = df.get("contract_code", "").astype(str).str.lower()
+
+    # =========================
+    # Buckets por book_name (API)
+    # =========================
+    # Equity BR: book indica RV Brasil e NÃO é derivativo
+    br_mask = (
+        _contains_any(df["book_l"], ["renda variável brasil", "renda variavel brasil", "renda variavel brasil >>", "renda variável brasil >>", "fundos >> fundos ações", "fundos >> fundos acoes"])
+        & (~is_deriv)
+    )
+
+    # Equity Global: book indica offshore/global e NÃO é derivativo
+    gl_mask = (
+        _contains_any(df["book_l"], ["renda variável offshore", "renda variavel offshore", "offshore", "renda variavel global", "renda variável global"])
+        & (~is_deriv)
+    )
+
+    br = df[br_mask]
+    gl = df[gl_mask]
+
+    bruto_br = float(br["val"].abs().sum())
+    liquido_br = float(br["val"].sum())
+    hedge_br = bruto_br - abs(liquido_br)
+
+    bruto_gl = float(gl["val"].abs().sum())
+    liquido_gl = float(gl["val"].sum())
+    hedge_gl = bruto_gl - abs(liquido_gl)
+
+    # =========================
+    # USD (ativos vs hedge)
+    # =========================
+    # Hedge USD: derivativos/currency que parecem DOL/WDO/NDF ou book de moedas/câmbio
+    usd_hedge_mask = (
+        is_deriv
+        & (
+            _contains_any(df["cc_l"], ["dol", "wdo", "ndf"])
+            | _contains_any(df["name_l"], ["ndf", "dol", "wdo", "dólar", "dolar"])
+            | _contains_any(df["book_l"], ["moedas", "câmbio", "cambio", "fx", "hedge"])
+        )
+    )
+
+    # Ativos USD: moeda USD (não-hedge)
+    usd_assets_mask = (df["currency"] == "USD") & (~usd_hedge_mask)
+
+    usd_assets = df[usd_assets_mask]
+    usd_hedge = df[usd_hedge_mask]
+
+    bruto_usd = float(usd_assets["val"].abs().sum()) + float(usd_hedge["val"].abs().sum())
+    liquido_usd = float(usd_assets["val"].sum()) + float(usd_hedge["val"].sum())
+
+    return {
+        "PL": PL,
+        "Exposição Bruta Ações Brasil": bruto_br,
+        "Exposição Líquida Ações Brasil": liquido_br,
+        "Hedges/Alavancagem Ações Brasil": hedge_br,
+        "Exposição Bruta Ações Globais": bruto_gl,
+        "Exposição Líquida Ações Globais": liquido_gl,
+        "Hedges/Alavancagem Ações Globais": hedge_gl,
+        "Exposição Bruta USD": bruto_usd,
+        "Exposição Líquida USD": liquido_usd,
+        "Exposição Bruta RV (overview)": equity_exposure,
+        "Enquadramento Renda Variável (%)": enquadramento_rv,
+        "_value_col": value_col,
+        "_currency_col": currency_id_col,
+        "_df_debug": df,
+    }
+
+
+# =========================
+# Tela principal
+# =========================
 def tela_alocacao():
     st.header("Alocação por Classe de Ativo")
 
@@ -100,7 +275,6 @@ def tela_alocacao():
         st.info("Selecione os filtros e clique em Consultar.")
         return
 
-    # ===== Payload =====
     payload = {
         "start_date": str(data_base),
         "end_date": str(data_base),
@@ -108,7 +282,7 @@ def tela_alocacao():
         "portfolio_ids": [carteira_id],
     }
 
-    # ===== Chamada API =====
+    # ===== API =====
     try:
         with st.spinner("Buscando posições..."):
             resp = requests.post(
@@ -121,148 +295,86 @@ def tela_alocacao():
             resultado = resp.json()
 
         objetos = resultado.get("objects", {})
-        inst_positions_acumulado = []
+        inst_positions = []
+        overviews = []
 
-        if isinstance(objetos, dict):
-            iter_values = objetos.values()
-        elif isinstance(objetos, list):
-            iter_values = objetos
-        else:
-            iter_values = []
-
+        iter_values = objetos.values() if isinstance(objetos, dict) else (objetos if isinstance(objetos, list) else [])
         for obj in iter_values:
-            pos = obj.get("instrument_positions") if isinstance(obj, dict) else None
-            if not pos:
+            if not isinstance(obj, dict):
                 continue
+            overviews.append(obj)
+            pos = obj.get("instrument_positions")
             if isinstance(pos, list):
-                inst_positions_acumulado.extend(pos)
+                inst_positions.extend(pos)
             elif isinstance(pos, dict):
-                inst_positions_acumulado.append(pos)
+                inst_positions.append(pos)
 
-        if not inst_positions_acumulado:
-            st.info("Nenhuma posição encontrada em objects.<ID>.instrument_positions para os filtros selecionados.")
+        if not inst_positions:
+            st.info("Nenhuma posição encontrada.")
             return
 
-        df = pd.json_normalize(inst_positions_acumulado)
+        df = pd.json_normalize(inst_positions)
 
     except Exception as e:
         st.error(f"Erro ao buscar posições: {e}")
         return
 
-    if df.empty:
-        st.info("Nenhuma posição encontrada para os filtros selecionados.")
+    overview = overviews[0] if overviews else {}
+
+    # ===== métricas =====
+    metricas = _calcular_metricas_gestao(overview, df)
+    if metricas.get("_erro"):
+        st.error(metricas["_erro"])
         return
 
-    # ===== Garantir numérico =====
-    df["asset_value"] = pd.to_numeric(df.get("asset_value", 0), errors="coerce").fillna(0)
+    st.subheader("Métricas de Gestão")
+    c1, c2, c3 = st.columns(3)
 
-    # ===== Alocação =====
-    if {"book_name", "asset_value"}.issubset(df.columns):
-        st.subheader("Alocação por Classe")
+    with c1:
+        st.metric("PL", f"R$ {_fmt_brl(metricas['PL'])}")
+        st.metric("Bruto Ações BR", f"R$ {_fmt_brl(metricas['Exposição Bruta Ações Brasil'])}")
+        st.metric("Líquido Ações BR", f"R$ {_fmt_brl(metricas['Exposição Líquida Ações Brasil'])}")
+        st.metric("Hedges/Alav. BR", f"R$ {_fmt_brl(metricas['Hedges/Alavancagem Ações Brasil'])}")
 
-        agg = df.groupby("book_name", as_index=False)["asset_value"].sum()
-        total = float(agg["asset_value"].sum())
-        agg["pct"] = agg["asset_value"] / total
+    with c2:
+        st.metric("Bruto Ações Globais", f"R$ {_fmt_brl(metricas['Exposição Bruta Ações Globais'])}")
+        st.metric("Líquido Ações Globais", f"R$ {_fmt_brl(metricas['Exposição Líquida Ações Globais'])}")
+        st.metric("Hedges/Alav. Globais", f"R$ {_fmt_brl(metricas['Hedges/Alavancagem Ações Globais'])}")
 
-        # Tabela de resumo (formatada pt-BR para exibição)
-        tabela_resumo = (
-            agg.assign(
-                Financeiro=lambda x: x["asset_value"].map(lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")),
-                pct=lambda x: (x["pct"] * 100).round(2).map(lambda v: str(v).replace(".", ","))
-            )
-            .rename(columns={"book_name": "Classe", "pct": "% Alocado"})
-            .drop(columns=["asset_value"])
+    with c3:
+        st.metric("USD Bruto", f"R$ {_fmt_brl(metricas['Exposição Bruta USD'])}")
+        st.metric("USD Líquido", f"R$ {_fmt_brl(metricas['Exposição Líquida USD'])}")
+        st.metric("Enquadramento RV (oficial)", f"{metricas['Enquadramento Renda Variável (%)']:.1f}%")
+
+    with st.expander("Debug (sanity + colunas usadas)"):
+        st.write("Coluna valor usada:", metricas["_value_col"])
+        st.write("Coluna moeda usada:", metricas["_currency_col"])
+        st.write("Equity exposure (overview): R$ " + _fmt_brl(metricas["Exposição Bruta RV (overview)"]))
+        st.write("BR+Global calculado: R$ " + _fmt_brl(metricas["Exposição Bruta Ações Brasil"] + metricas["Exposição Bruta Ações Globais"]))
+
+    # ===== Pizza (asset_value) =====
+    if "asset_value" not in df.columns:
+        st.warning("Sem 'asset_value' nas posições; pizza de alocação não disponível.")
+        return
+
+    df["asset_value"] = pd.to_numeric(df["asset_value"], errors="coerce").fillna(0.0)
+    agg = df.groupby("book_name", as_index=False)["asset_value"].sum()
+    total = float(agg["asset_value"].sum())
+    agg["pct"] = (agg["asset_value"] / total) if total else 0.0
+
+    st.subheader("Alocação por Classe")
+    tabela_resumo = (
+        agg.assign(
+            Financeiro=lambda x: x["asset_value"].map(_fmt_brl),
+            **{"% Alocado": lambda x: (x["pct"] * 100).round(2).map(lambda v: str(v).replace(".", ","))}
         )
-        st.dataframe(tabela_resumo, use_container_width=True)
+        .rename(columns={"book_name": "Classe"})
+        .drop(columns=["asset_value", "pct"])
+    )
+    st.dataframe(tabela_resumo, use_container_width=True, hide_index=True)
 
-        # Donut chart (percentuais em NEGRITO)
-        agg_pizza = _consolidar_outros(agg, limiar=PIZZA_LIMIAR_OUTROS)
-        fig_pizza = _fig_pizza(agg_pizza)
-        st.plotly_chart(fig_pizza, use_container_width=True)
-
-        # ===== Drilldown =====
-        st.subheader("Detalhamento por Classe")
-        detalhados_frames = []  # para exportação
-        for classe, grupo in df.groupby("book_name"):
-            subtotal = float(grupo["asset_value"].sum())
-            if subtotal == 0:
-                continue
-
-            detalhado_num = (
-                grupo[["instrument_name", "asset_value"]]
-                .rename(columns={"instrument_name": "Nome", "asset_value": "Financeiro"})
-                .copy()
-            )
-            detalhado_num["% Alocado"] = (detalhado_num["Financeiro"] / subtotal * 100).round(2)
-
-            # Guardar versão numérica para Excel
-            detalhado_num.insert(0, "Classe", classe)
-            detalhados_frames.append(detalhado_num)
-
-            # Versão formatada pt-BR para tela
-            detalhado_view = detalhado_num.copy()
-            detalhado_view["Financeiro"] = detalhado_view["Financeiro"].map(
-                lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            )
-            detalhado_view["% Alocado"] = detalhado_view["% Alocado"].map(lambda v: str(v).replace(".", ","))
-
-            with st.expander(
-                f"Classe: {classe} — Total: {subtotal:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            ):
-                st.dataframe(detalhado_view, use_container_width=True)
-
-        # ===== Botão: Baixar Excel (tudo) =====
-        try:
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                # Resumo por classe (numérico)
-                resumo_export = agg[["book_name", "asset_value", "pct"]].rename(
-                    columns={"book_name": "Classe", "asset_value": "Financeiro", "pct": "% Alocado"}
-                )
-                resumo_export.to_excel(writer, index=False, sheet_name="Resumo_Classe")
-
-                # Detalhe (numérico)
-                if detalhados_frames:
-                    detalhe_export = pd.concat(detalhados_frames, ignore_index=True)
-                    detalhe_export.to_excel(writer, index=False, sheet_name="Detalhe")
-
-                # Raw positions também podem ser úteis
-                df.to_excel(writer, index=False, sheet_name="Raw_Positions")
-
-                # Formatação leve
-                workbook = writer.book
-                pct_fmt = workbook.add_format({"num_format": "0.00%"})
-                money_fmt = workbook.add_format({"num_format": "#,##0.00"})
-                bold_hdr = workbook.add_format({"bold": True})
-
-                # Ajustar Resumo_Classe
-                ws_resumo = writer.sheets["Resumo_Classe"]
-                ws_resumo.set_row(0, None, bold_hdr)
-                # colunas: Classe (0), Financeiro (1), % Alocado (2)
-                ws_resumo.set_column(0, 0, 28)
-                ws_resumo.set_column(1, 1, 18, money_fmt)
-                ws_resumo.set_column(2, 2, 12, pct_fmt)
-
-                # Ajustar Detalhe, se houver
-                if "Detalhe" in writer.sheets:
-                    ws_det = writer.sheets["Detalhe"]
-                    ws_det.set_row(0, None, bold_hdr)
-                    # Classe, Nome, Financeiro, % Alocado
-                    ws_det.set_column(0, 0, 22)
-                    ws_det.set_column(1, 1, 42)
-                    ws_det.set_column(2, 2, 18, money_fmt)
-                    ws_det.set_column(3, 3, 12, pct_fmt)
+    agg_pizza = _consolidar_outros(agg, limiar=PIZZA_LIMIAR_OUTROS)
+    st.plotly_chart(_fig_pizza(agg_pizza), use_container_width=True)
 
 
-            st.download_button(
-                label="⬇️ Baixar Excel (Resumo + Detalhe + Raw)",
-                data=buffer.getvalue(),
-                file_name=f"{nome_carteira}_alocacao_{str(data_base)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"Falha ao gerar Excel: {e}")
 
-    else:
-        st.info("Colunas esperadas (book_name, asset_value) não encontradas.")

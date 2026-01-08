@@ -368,7 +368,7 @@ def tela_simulacao() -> None:
                 key="sim_sel_exist",
                 label_visibility="collapsed"
             )
-            st.markdown('<div class="help">Selecione para adicionar linhas abaixo. Ajuste a Classe e ΔR$.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="help">Selecione para adicionar linhas abaixo. Ajuste a Classe e ΔR$ (negativo para venda e positivo para compra).</div>', unsafe_allow_html=True)
 
             # remove quem saiu
             for nome in list(st.session_state.sim_exist_rows.keys()):
@@ -417,7 +417,7 @@ def tela_simulacao() -> None:
 
             c3, c4 = st.columns([1, 1])
             with c3:
-                st.session_state.sim_novo_valor = st.number_input("Valor (R$)", value=float(st.session_state.sim_novo_valor), step=1000.0, key="sim_input_novo_valor")
+                st.session_state.sim_novo_valor = st.number_input("Valor (R$)  (negativo para venda e positivo para compra)", value=float(st.session_state.sim_novo_valor), step=1000.0, key="sim_input_novo_valor")
             with c4:
                 if st.button("Adicionar NOVO", key="sim_btn_add_novo", use_container_width=True):
                     if not st.session_state.sim_novo_nome or not st.session_state.sim_novo_classe or float(st.session_state.sim_novo_valor) == 0:
