@@ -40,7 +40,7 @@ def _to_float(x, default=0.0) -> float:
 
 def _fmt_brl(v: float) -> str:
     try:
-        return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"{float(v):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "0,00"
 
@@ -57,6 +57,20 @@ def _contains_any(series: pd.Series, words: list[str]) -> pd.Series:
     for w in words:
         mask = mask | series.str.contains(w, na=False)
     return mask
+
+
+def _pct_from_series_sum(s: pd.Series) -> float:
+    """
+    Soma percentuais respeitando sinal.
+    Se vier em fração (0-1), converte para 0-100.
+    Se vier em % já (ex 12.3), mantém.
+    """
+    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    mx = float(s.abs().max()) if len(s) else 0.0
+    # Heurística robusta:
+    # - se máximo <= 1.5 -> fração
+    # - senão -> já é %
+    return float(s.sum() * 100.0) if mx <= 1.5 else float(s.sum())
 
 
 # =========================
@@ -139,110 +153,138 @@ def _fig_pizza(agg: pd.DataFrame):
 
 
 # =========================
-# Métricas (API-only)
+# Métricas (GABARITO + Hedge DOL em %Exposição)
 # =========================
 def _calcular_metricas_gestao(overview: dict, df_positions: pd.DataFrame) -> dict:
     df = df_positions.copy()
 
-    # PL e enquadramento oficial
     PL = _to_float(overview.get("net_asset_value", 0))
     equity_exposure = _to_float(overview.get("equity_exposure", 0))
     enquadramento_rv = (equity_exposure / PL * 100) if PL else 0.0
 
-    # valor com sinal (obrigatório para líquido/hedge)
+    # valor com sinal (gabarito exige isso)
     value_col = _pick_first_existing(df, ["exposure_value", "last_exposure_value"])
     if value_col is None:
-        # fallback: vai rodar, mas líquido/hedge fica menos confiável
-        value_col = _pick_first_existing(df, ["financial_value", "market_value", "asset_value"])
-
-    if value_col is None:
-        return {"_erro": "Sem coluna de valor (exposure_value/asset_value/etc).", "PL": PL}
+        return {"_erro": "Sem exposure_value. O gabarito exige valor com sinal.", "PL": PL}
 
     df["val"] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
 
-    # moeda
+    # moeda (câmbio)
     currency_id_col = _pick_first_existing(df, ["original_currency_id", "currency_id", "instrument_currency_id"])
     if currency_id_col is not None:
         df["currency"] = df[currency_id_col].map(CURRENCY_ID_MAP).fillna(df[currency_id_col].astype(str))
     else:
         df["currency"] = "BRL"
 
-    # instrument_type
-    if "instrument_type" in df.columns:
-        df["type_l"] = df["instrument_type"].map(INSTRUMENT_TYPE_MAP).fillna(df["instrument_type"].astype(str)).astype(str).str.lower()
-    else:
-        df["type_l"] = "unknown"
-
-    is_deriv = df["type_l"].isin(["future", "option", "swap", "cfd", "currency"])
-
-    # textos
+    # book_name (único critério)
     df["book_l"] = df.get("book_name", "").astype(str).str.lower()
-    df["name_l"] = df.get("instrument_name", "").astype(str).str.lower()
-    df["cc_l"] = df.get("contract_code", "").astype(str).str.lower()
 
-    # =========================
-    # Buckets por book_name (API)
-    # =========================
-    # Equity BR: book indica RV Brasil e NÃO é derivativo
-    br_mask = (
-        _contains_any(df["book_l"], ["renda variável brasil", "renda variavel brasil", "renda variavel brasil >>", "renda variável brasil >>", "fundos >> fundos ações", "fundos >> fundos acoes"])
-        & (~is_deriv)
-    )
+    # ============================================================
+    # BRASIL (NOVA REGRA): tudo em RV Brasil menos índice/futuros/opções/hedge
+    # ============================================================
+    rv_br_all = _contains_any(df["book_l"], ["renda variável brasil", "renda variavel brasil"])
 
-    # Equity Global: book indica offshore/global e NÃO é derivativo
-    gl_mask = (
-        _contains_any(df["book_l"], ["renda variável offshore", "renda variavel offshore", "offshore", "renda variavel global", "renda variável global"])
-        & (~is_deriv)
-    )
+    KW_IDX_BR = [
+        "índice", "indice",
+        "hedge",
+        "futuro", "futuros",
+        "opção", "opções", "opcao", "opcoes",
+        "ibov", "ibovespa", "win",
+    ]
+    idx_br = rv_br_all & _contains_any(df["book_l"], KW_IDX_BR)
 
-    br = df[br_mask]
-    gl = df[gl_mask]
+    rv_br_base = rv_br_all & (~idx_br)
 
-    bruto_br = float(br["val"].abs().sum())
-    liquido_br = float(br["val"].sum())
-    hedge_br = bruto_br - abs(liquido_br)
+    exp_bruta_rv_br = float(df.loc[rv_br_base, "val"].abs().sum())
+    hedge_indice_br = float(df.loc[idx_br, "val"].sum())
+    exp_liq_rv_br = exp_bruta_rv_br + hedge_indice_br
 
-    bruto_gl = float(gl["val"].abs().sum())
-    liquido_gl = float(gl["val"].sum())
-    hedge_gl = bruto_gl - abs(liquido_gl)
+    # ============================================================
+    # GLOBAL (REGRA ANTERIOR): listas explícitas (como você disse que estava certo)
+    # ============================================================
+    BOOK_RV_GL = [
+        "renda variável offshore >> etfs",
+        "renda variavel offshore >> etfs",
+        "renda variável offshore >> ações",
+        "renda variavel offshore >> acoes",
+        "renda variável offshore >> etf",
+        "renda variavel offshore >> etf",
+    ]
 
-    # =========================
-    # USD (ativos vs hedge)
-    # =========================
-    # Hedge USD: derivativos/currency que parecem DOL/WDO/NDF ou book de moedas/câmbio
-    usd_hedge_mask = (
-        is_deriv
-        & (
-            _contains_any(df["cc_l"], ["dol", "wdo", "ndf"])
-            | _contains_any(df["name_l"], ["ndf", "dol", "wdo", "dólar", "dolar"])
-            | _contains_any(df["book_l"], ["moedas", "câmbio", "cambio", "fx", "hedge"])
-        )
-    )
+    BOOK_IDX_GL = [
+        "renda variável offshore >> índice",
+        "renda variavel offshore >> indice",
+        "hedge ações globais",
+        "hedge acoes globais",
+    ]
 
-    # Ativos USD: moeda USD (não-hedge)
-    usd_assets_mask = (df["currency"] == "USD") & (~usd_hedge_mask)
+    rv_gl_base = _contains_any(df["book_l"], BOOK_RV_GL)
+    idx_gl = _contains_any(df["book_l"], BOOK_IDX_GL)
 
-    usd_assets = df[usd_assets_mask]
-    usd_hedge = df[usd_hedge_mask]
+    exp_bruta_rv_gl = float(df.loc[rv_gl_base & ~idx_gl, "val"].abs().sum())
+    hedge_indice_gl = float(df.loc[idx_gl, "val"].sum())
+    exp_liq_rv_gl = exp_bruta_rv_gl + hedge_indice_gl
 
-    bruto_usd = float(usd_assets["val"].abs().sum()) + float(usd_hedge["val"].abs().sum())
-    liquido_usd = float(usd_assets["val"].sum()) + float(usd_hedge["val"].sum())
+    # ============================================================
+    # HEDGE DÓLAR (g): somente por book + % Exposição
+    # ============================================================
+    BOOK_HEDGE_DOL = [
+        "moedas >> futuros",
+        "câmbio",
+        "cambio",
+        "fx",
+        "hedge moedas",
+    ]
+
+
+    hedge_dol_mask = _contains_any(df["book_l"], BOOK_HEDGE_DOL)
+    outros = _contains_any(df["book_l"], ["moedas >> outros"])
+    hedge_dol = float(df.loc[hedge_dol_mask, "val"].sum())
+
+    if "pct_asset_value" not in df.columns:
+        raise ValueError("pct_asset_value não veio na API. Sem isso NÃO dá para calcular % Exposição do Hedge DOL.")
+    hedge_dol_pct = _pct_from_series_sum(df.loc[hedge_dol_mask, "pct_asset_value"])
+
+    # Net Dólar (aproximação API-only: Global líquido + hedge dol + USD fora do book global)
+    moedas_outros =  float(df.loc[outros, "val"].sum())
+    print("AAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    print (moedas_outros)
+    print("BBBBBBBBBBBBBBBBBBBBBBBBBBB")
+    net_dolar = exp_bruta_rv_gl + hedge_dol + moedas_outros
+    net_dolar_pct = (net_dolar / PL * 100) if PL else 0.0
+
+    def pct_pl(x):
+        return (x / PL * 100) if PL else 0.0
 
     return {
         "PL": PL,
-        "Exposição Bruta Ações Brasil": bruto_br,
-        "Exposição Líquida Ações Brasil": liquido_br,
-        "Hedges/Alavancagem Ações Brasil": hedge_br,
-        "Exposição Bruta Ações Globais": bruto_gl,
-        "Exposição Líquida Ações Globais": liquido_gl,
-        "Hedges/Alavancagem Ações Globais": hedge_gl,
-        "Exposição Bruta USD": bruto_usd,
-        "Exposição Líquida USD": liquido_usd,
-        "Exposição Bruta RV (overview)": equity_exposure,
-        "Enquadramento Renda Variável (%)": enquadramento_rv,
+        "Enquadramento RV (%)": enquadramento_rv,
+
+        "Exp. Bruta RV Brasil": exp_bruta_rv_br,
+        "HEDGE ÍNDICE BR": hedge_indice_br,
+        "Exp. Líquida RV Brasil": exp_liq_rv_br,
+
+        "Exp. Bruta RV Global": exp_bruta_rv_gl,
+        "HEDGE ÍNDICE Global": hedge_indice_gl,
+        "Exp. Líquida RV Global": exp_liq_rv_gl,
+
+        "HEDGE DOL": hedge_dol,
+        "HEDGE DOL %": pct_pl(hedge_dol),
+
+        "Net Dólar": net_dolar,
+        "Net Dólar %": net_dolar_pct,
+
+        # percentuais (por PL) para RV
+        "Exp. Bruta RV Brasil %": pct_pl(exp_bruta_rv_br),
+        "HEDGE ÍNDICE BR %": pct_pl(hedge_indice_br),
+        "Exp. Líquida RV Brasil %": pct_pl(exp_liq_rv_br),
+
+        "Exp. Bruta RV Global %": pct_pl(exp_bruta_rv_gl),
+        "HEDGE ÍNDICE Global %": pct_pl(hedge_indice_gl),
+        "Exp. Líquida RV Global %": pct_pl(exp_liq_rv_gl),
+
         "_value_col": value_col,
         "_currency_col": currency_id_col,
-        "_df_debug": df,
     }
 
 
@@ -321,36 +363,34 @@ def tela_alocacao():
 
     overview = overviews[0] if overviews else {}
 
-    # ===== métricas =====
     metricas = _calcular_metricas_gestao(overview, df)
     if metricas.get("_erro"):
         st.error(metricas["_erro"])
         return
 
-    st.subheader("Métricas de Gestão")
+    st.subheader("Métricas de Gestão (gabarito)")
     c1, c2, c3 = st.columns(3)
 
     with c1:
         st.metric("PL", f"R$ {_fmt_brl(metricas['PL'])}")
-        st.metric("Bruto Ações BR", f"R$ {_fmt_brl(metricas['Exposição Bruta Ações Brasil'])}")
-        st.metric("Líquido Ações BR", f"R$ {_fmt_brl(metricas['Exposição Líquida Ações Brasil'])}")
-        st.metric("Hedges/Alav. BR", f"R$ {_fmt_brl(metricas['Hedges/Alavancagem Ações Brasil'])}")
+        st.metric("Nível RV (oficial)", f"{metricas['Enquadramento RV (%)']:.1f}%")
 
     with c2:
-        st.metric("Bruto Ações Globais", f"R$ {_fmt_brl(metricas['Exposição Bruta Ações Globais'])}")
-        st.metric("Líquido Ações Globais", f"R$ {_fmt_brl(metricas['Exposição Líquida Ações Globais'])}")
-        st.metric("Hedges/Alav. Globais", f"R$ {_fmt_brl(metricas['Hedges/Alavancagem Ações Globais'])}")
+        st.metric("Exp. Bruta RV Brasil", f"R$ {_fmt_brl(metricas['Exp. Bruta RV Brasil'])}  ({metricas['Exp. Bruta RV Brasil %']:.1f}%)")
+        st.metric("HEDGE ÍNDICE BR", f"R$ {_fmt_brl(metricas['HEDGE ÍNDICE BR'])}  ({metricas['HEDGE ÍNDICE BR %']:.1f}%)")
+        st.metric("Exp. Líquida RV Brasil", f"R$ {_fmt_brl(metricas['Exp. Líquida RV Brasil'])}  ({metricas['Exp. Líquida RV Brasil %']:.1f}%)")
 
     with c3:
-        st.metric("USD Bruto", f"R$ {_fmt_brl(metricas['Exposição Bruta USD'])}")
-        st.metric("USD Líquido", f"R$ {_fmt_brl(metricas['Exposição Líquida USD'])}")
-        st.metric("Enquadramento RV (oficial)", f"{metricas['Enquadramento Renda Variável (%)']:.1f}%")
+        st.metric("Exp. Bruta RV Global", f"R$ {_fmt_brl(metricas['Exp. Bruta RV Global'])}  ({metricas['Exp. Bruta RV Global %']:.1f}%)")
+        st.metric("HEDGE ÍNDICE Global", f"R$ {_fmt_brl(metricas['HEDGE ÍNDICE Global'])}  ({metricas['HEDGE ÍNDICE Global %']:.1f}%)")
+        st.metric("Exp. Líquida RV Global", f"R$ {_fmt_brl(metricas['Exp. Líquida RV Global'])}  ({metricas['Exp. Líquida RV Global %']:.1f}%)")
 
-    with st.expander("Debug (sanity + colunas usadas)"):
-        st.write("Coluna valor usada:", metricas["_value_col"])
-        st.write("Coluna moeda usada:", metricas["_currency_col"])
-        st.write("Equity exposure (overview): R$ " + _fmt_brl(metricas["Exposição Bruta RV (overview)"]))
-        st.write("BR+Global calculado: R$ " + _fmt_brl(metricas["Exposição Bruta Ações Brasil"] + metricas["Exposição Bruta Ações Globais"]))
+    st.markdown("---")
+    c4, c5 = st.columns(2)
+    with c4:
+        st.metric("HEDGE DOL", f"R$ {_fmt_brl(metricas['HEDGE DOL'])}  ({metricas['HEDGE DOL %']:.1f}%)")
+    with c5:
+        st.metric("Net Dólar", f"R$ {_fmt_brl(metricas['Net Dólar'])}  ({metricas['Net Dólar %']:.1f}%)")
 
     # ===== Pizza (asset_value) =====
     if "asset_value" not in df.columns:
@@ -375,6 +415,3 @@ def tela_alocacao():
 
     agg_pizza = _consolidar_outros(agg, limiar=PIZZA_LIMIAR_OUTROS)
     st.plotly_chart(_fig_pizza(agg_pizza), use_container_width=True)
-
-
-
