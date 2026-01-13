@@ -266,6 +266,7 @@ def mostrar_carteira(ctx=None):
                     "end_date": str(data_fim),
                     "instrument_position_aggregation": 3,
                     "portfolio_ids": selected_ids,
+                    "include_profitabilities": True,
                 }
 
                 try:
@@ -281,7 +282,6 @@ def mostrar_carteira(ctx=None):
                     r.raise_for_status()
                     resultado = r.json()
                     objetos = resultado.get("objects", {})
-                    st.dataframe(objetos)
 
                     registros = []
                     for item in objetos.values():
