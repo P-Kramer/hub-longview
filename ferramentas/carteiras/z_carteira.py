@@ -281,6 +281,7 @@ def mostrar_carteira(ctx=None):
                     r.raise_for_status()
                     resultado = r.json()
                     objetos = resultado.get("objects", {})
+                    st.dataframe(objetos)
 
                     registros = []
                     for item in objetos.values():
