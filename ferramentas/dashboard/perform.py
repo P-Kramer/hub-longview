@@ -13,12 +13,18 @@ import plotly.express as px
 
 from utils import BASE_URL_API, CARTEIRAS
 
-# yfinance só é usado se você habilitar benchmarks externos específicos
-try:
-    import yfinance as yf
-    _HAS_YF = True
-except Exception:
-    _HAS_YF = False
+
+# ============================================================
+# BENCHMARKS (backend instrument_ids -> label)
+# ============================================================
+BENCHMARKS: Dict[int, str] = {
+    9: "CDI",
+    6: "Dolar",
+    11: "IPCA",
+    265: "Ibovespa",
+    1533: "IMAB",
+}
+BENCHMARK_NAME_TO_ID: Dict[str, int] = {v: k for k, v in BENCHMARKS.items()}
 
 
 # --------------------------
@@ -66,11 +72,20 @@ def _periods(today: Optional[pd.Timestamp] = None, windows: Optional[List[str]] 
 
 
 def _fmt_pct(x: Any) -> str:
+    
     try:
         x = float(x)
     except Exception:
         return ""
-    return "" if pd.isna(x) else f"{x*100:.2f}%"
+    if pd.isna(x):
+        return ""
+
+    # Se vier em decimal (0.0188), vira 1.88%
+    # Se vier em % já (1.88), deixa como 1.88%
+    if abs(x) <= 1.0:
+        return f"{x * 100:.2f}%"
+    return f"{x:.2f}%"
+
 
 
 def _fmt_pp(pp: Any) -> str:
@@ -88,7 +103,7 @@ def _parse_percentage_value(value) -> float:
     try:
         if isinstance(value, str):
             cleaned = value.replace("%", "").replace(",", ".").strip()
-            return float(cleaned) / 100.0
+            return float(cleaned)
         if isinstance(value, (int, float, np.number)):
             return float(value)
         return np.nan
@@ -114,188 +129,18 @@ def _safe_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     return out
 
 
-def _style_rank_arrows(df: pd.DataFrame, cols: List[str]) -> "pd.io.formats.style.Styler":
-    """
-    Estilo sem matplotlib: destaca top/bottom 3 por coluna
-    (verde claro = top, vermelho claro = bottom).
-    """
-    sty = df.style
-
-    def _hl_top_bottom(s: pd.Series):
-        # s é uma coluna numérica
-        s_num = pd.to_numeric(s, errors="coerce")
-        top_idx = s_num.nlargest(min(3, s_num.notna().sum())).index
-        bot_idx = s_num.nsmallest(min(3, s_num.notna().sum())).index
-        out = pd.Series([""] * len(s), index=s.index)
-
-        out.loc[top_idx] = "background-color: #d7f5e6"   # verde claro
-        out.loc[bot_idx] = "background-color: #ffd6d6"   # vermelho claro
-        return out
-
-    for c in cols:
-        if c in df.columns:
-            sty = sty.apply(_hl_top_bottom, subset=[c])
-    return sty
-
-
-
-# --------------------------
-# API dos Indicadores Econômicos
-# --------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_cdi_data() -> Dict[str, Any]:
-    """Busca dados do CDI/SELIC."""
-    try:
-        url_selic = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json"
-        r_selic = requests.get(url_selic, timeout=10)
-        r_selic.raise_for_status()
-        selic_data = r_selic.json()
-        selic_value = float(selic_data[0]["valor"]) if selic_data else 0.0
-
-        current_year = datetime.now().year
-        url_cdi_acum = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.4391/dados?formato=json&dataInicial=01/01/{current_year}"
-        r_cdi_acum = requests.get(url_cdi_acum, timeout=10)
-        r_cdi_acum.raise_for_status()
-        cdi_acum_data = r_cdi_acum.json()
-        cdi_acum = float(cdi_acum_data[-1]["valor"]) if cdi_acum_data else 0.0
-
-        return {"selic_meta": selic_value, "cdi_acum_ano": cdi_acum, "fonte": "Banco Central do Brasil"}
-    except Exception as e:
-        st.error(f"Erro ao buscar CDI: {e}")
-        return {"selic_meta": 0.0, "cdi_acum_ano": 0.0, "fonte": "Erro"}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_imab_data() -> Dict[str, Any]:
-    """Busca dados do IMA-B via ETF IMAB11 como proxy."""
-    try:
-        if _HAS_YF:
-            imab = yf.Ticker("IMAB11.SA")
-            hist = imab.history(period="1y")
-            if not hist.empty:
-                price_current = hist["Close"].iloc[-1]
-                price_prev = hist["Close"].iloc[-2] if len(hist) > 1 else price_current
-                daily_change = ((price_current - price_prev) / price_prev) * 100
-
-                current_year = datetime.now().year
-                year_start = f"{current_year}-01-01"
-                hist_ytd = imab.history(start=year_start)
-                ytd_change = ((hist_ytd["Close"].iloc[-1] - hist_ytd["Close"].iloc[0]) / hist_ytd["Close"].iloc[0]) * 100 if len(hist_ytd) > 1 else 0.0
-
-                return {
-                    "valor_atual": float(price_current),
-                    "variacao_dia": float(daily_change),
-                    "variacao_ytd": float(ytd_change),
-                    "fonte": "YFinance (IMAB11)"
-                }
-    except Exception as e:
-        st.error(f"Erro ao buscar IMA-B: {e}")
-
-    return {"valor_atual": 0.0, "variacao_dia": 0.0, "variacao_ytd": 0.0, "fonte": "Erro"}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _fetch_dolar_data() -> Dict[str, Any]:
-    """Busca cotação do dólar (BCB) com fallback Yahoo Finance."""
-    try:
-        url_bcb = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados/ultimos/1?formato=json"
-        r_bcb = requests.get(url_bcb, timeout=10)
-        r_bcb.raise_for_status()
-        bcb_data = r_bcb.json()
-
-        if bcb_data:
-            dolar_bcb = float(bcb_data[0]["valor"])
-            url_bcb_prev = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados/ultimos/2?formato=json"
-            r_bcb_prev = requests.get(url_bcb_prev, timeout=10)
-            r_bcb_prev.raise_for_status()
-            bcb_prev_data = r_bcb_prev.json()
-
-            if len(bcb_prev_data) == 2:
-                dolar_prev = float(bcb_prev_data[0]["valor"])
-                variation = ((dolar_bcb - dolar_prev) / dolar_prev) * 100
-            else:
-                variation = 0.0
-
-            return {"cotacao": float(dolar_bcb), "variacao": float(variation), "fonte": "Banco Central do Brasil"}
-    except Exception:
-        if _HAS_YF:
-            try:
-                usdbrl = yf.Ticker("USDBRL=X")
-                hist = usdbrl.history(period="2d")
-                if len(hist) >= 2:
-                    price_current = hist["Close"].iloc[-1]
-                    price_prev = hist["Close"].iloc[-2]
-                    variation = ((price_current - price_prev) / price_prev) * 100
-                    return {"cotacao": float(price_current), "variacao": float(variation), "fonte": "YFinance (Fallback)"}
-            except Exception as yf_error:
-                st.error(f"Erro ao buscar dólar YFinance: {yf_error}")
-
-    return {"cotacao": 0.0, "variacao": 0.0, "fonte": "Erro"}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _fetch_sp500_data() -> Dict[str, Any]:
-    """Busca dados do S&P 500."""
-    try:
-        if _HAS_YF:
-            sp500 = yf.Ticker("^GSPC")
-            hist = sp500.history(period="2d")
-            if len(hist) >= 2:
-                price_current = hist["Close"].iloc[-1]
-                price_prev = hist["Close"].iloc[-2]
-                daily_change = ((price_current - price_prev) / price_prev) * 100
-
-                current_year = datetime.now().year
-                year_start = f"{current_year}-01-01"
-                hist_ytd = sp500.history(start=year_start)
-                ytd_change = ((hist_ytd["Close"].iloc[-1] - hist_ytd["Close"].iloc[0]) / hist_ytd["Close"].iloc[0]) * 100 if len(hist_ytd) > 1 else 0.0
-
-                return {
-                    "valor_atual": float(price_current),
-                    "variacao_dia": float(daily_change),
-                    "variacao_ytd": float(ytd_change),
-                    "fonte": "YFinance"
-                }
-    except Exception as e:
-        st.error(f"Erro ao buscar S&P 500: {e}")
-
-    return {"valor_atual": 0.0, "variacao_dia": 0.0, "variacao_ytd": 0.0, "fonte": "Erro"}
-
-
-def _display_indicators():
-    """Exibe os indicadores econômicos sem HTML/CSS."""
-    st.markdown("### Indicadores Econômicos")
-    with st.spinner("Atualizando indicadores..."):
-        cdi_data = _fetch_cdi_data()
-        imab_data = _fetch_imab_data()
-        dolar_data = _fetch_dolar_data()
-        sp500_data = _fetch_sp500_data()
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("CDI/SELIC (meta anual)", f"{cdi_data['selic_meta']:.2f}%", f"{cdi_data['cdi_acum_ano']:.2f}% (YTD)")
-        st.caption(f"Fonte: {cdi_data['fonte']}")
-    with col2:
-        st.metric("IMA-B (IMAB11)", f"R$ {imab_data['valor_atual']:.2f}", f"{imab_data['variacao_dia']:.2f}%")
-        st.caption(f"YTD: {imab_data['variacao_ytd']:.2f}% | {imab_data['fonte']}")
-    with col3:
-        st.metric("USD/BRL", f"R$ {dolar_data['cotacao']:.2f}", f"{dolar_data['variacao']:.2f}%")
-        st.caption(f"Fonte: {dolar_data['fonte']}")
-    with col4:
-        st.metric("S&P 500", f"{sp500_data['valor_atual']:.0f}", f"{sp500_data['variacao_dia']:.2f}%")
-        st.caption(f"YTD: {sp500_data['variacao_ytd']:.2f}% | {sp500_data['fonte']}")
-
-
 # --------------------------
 # API (posições)
 # --------------------------
 def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], headers: Dict[str, str]) -> pd.DataFrame:
     payload = {
-        "start_date": str(start_date),
-        "end_date": str(end_date),
-        "instrument_position_aggregation": 3,
-        "portfolio_ids": portfolio_ids
-    }
+    "start_date": str(start_date),
+    "end_date": str(start_date),
+    "instrument_position_aggregation": 3,
+    "portfolio_ids": portfolio_ids,
+    "include_profitabilities": True,
+}
+    
     try:
         r = requests.post(
             f"{BASE_URL_API}/portfolio_position/positions/get",
@@ -303,9 +148,11 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
             headers=headers,
             timeout=60
         )
+        
         r.raise_for_status()
         resultado = r.json()
         dados = resultado.get("objects", {})
+        print (dados)
         registros: List[dict] = []
         for item in dados.values():
             if isinstance(item, list):
@@ -367,8 +214,7 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
             "fixed_navps": "Cota Fixa",
             "financial_transaction_positions": "CPR",
         }, inplace=True)
-
-        # Tipos
+        st.dataframe(df)
         if "Data" in df.columns:
             df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
         if "Cota Líquida" in df.columns:
@@ -386,30 +232,162 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
 
 
 # --------------------------
+# Market Data (benchmarks) - prices/get  (PAYLOAD CORRETO: instrument_ids)
+# --------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _post_market_prices(
+    start_date: date,
+    end_date: date,
+    instrument_ids: List[int],
+    headers: Dict[str, str],
+) -> pd.DataFrame:
+    """
+    Payload correto:
+      {"start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD","instrument_ids":[...]}
+
+    Retorna DataFrame: [InstrumentID, Data, Preco]
+    """
+    if not instrument_ids:
+        return pd.DataFrame(columns=["InstrumentID", "Data", "Preco"])
+
+    payload = {
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "instrument_ids": instrument_ids,
+    }
+
+    try:
+        r = requests.post(
+            f"{BASE_URL_API}/market_data/pricing/prices/get",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        root = data.get("objects", data)
+
+        points: Optional[List[dict]] = None
+        if isinstance(root, dict):
+            for k in ("prices", "data", "items", "results"):
+                v = root.get(k)
+                if isinstance(v, list):
+                    points = v
+                    break
+
+        rows: List[Dict[str, Any]] = []
+
+        if isinstance(root, list):
+            points = root
+
+        if isinstance(points, list):
+            for p in points:
+                iid = p.get("instrument_id") or p.get("id") or p.get("instrument")
+                dt = p.get("date") or p.get("datetime") or p.get("ref_date")
+                pr = p.get("price") or p.get("value") or p.get("close") or p.get("last")
+                if iid is None or dt is None or pr is None:
+                    continue
+                rows.append({"InstrumentID": iid, "Data": dt, "Preco": pr})
+
+        elif isinstance(root, dict):
+            for key, pts in root.items():
+                if not isinstance(pts, list):
+                    continue
+                try:
+                    iid_key = int(key)
+                except Exception:
+                    continue
+
+                for p in pts:
+                    dt = p.get("date") or p.get("datetime") or p.get("ref_date")
+                    pr = p.get("price") or p.get("value") or p.get("close") or p.get("last")
+                    if dt is None or pr is None:
+                        continue
+                    rows.append({"InstrumentID": iid_key, "Data": dt, "Preco": pr})
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        df["InstrumentID"] = pd.to_numeric(df["InstrumentID"], errors="coerce")
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
+        df["Preco"] = pd.to_numeric(df["Preco"], errors="coerce")
+
+        df = df.dropna(subset=["InstrumentID", "Data", "Preco"]).copy()
+        df["InstrumentID"] = df["InstrumentID"].astype(int)
+        df = df.sort_values(["InstrumentID", "Data"]).drop_duplicates(["InstrumentID", "Data"], keep="last")
+
+
+        return df
+
+    except requests.HTTPError:
+        try:
+            st.error(f"Erro ao buscar preços de benchmarks: {r.status_code}")
+            st.code(r.text)
+        except Exception:
+            st.error("Erro ao buscar preços de benchmarks (HTTPError sem body).")
+        return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Erro ao buscar preços de benchmarks: {e}")
+        return pd.DataFrame()
+
+
+# --------------------------
 # Rolling returns - Carteiras
 # --------------------------
-def _compute_portfolio_rolling_returns(
-    df: pd.DataFrame,
-    carteira: str,
-    periods_dict: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]],
-) -> Dict[str, float]:
-    """
-    Retornos móveis por janela usando a Cota Líquida.
-    Correto:
-      - End = último ponto disponível <= end_ts
-      - Start = as-of (último <= start_ts)
-    """
-    out: Dict[str, float] = {k: 0.0 for k in periods_dict.keys()}
+WINDOW_TO_BACKEND_COL = {
+    "1d":  "%Dia",
+    "1m":  "%Mês",
+    "3m":  "%3 Meses",     # se existir no df; se não existir, você não pode oferecer 3m
+    "6m":  "%6 Meses",     # NÃO use %Semestre se você já tem %6 Meses
+    "12m": "%12 Meses",    # use o específico, não %Ano
+    "18m": "%18 Meses",
+    "24m": "%24 Meses",
+}
 
+
+def _get_portfolio_returns_from_backend_df(df: pd.DataFrame, carteira: str, windows: List[str]) -> Dict[str, float]:
+    out = {w: np.nan for w in windows}
     sub = df[df["Carteira"] == carteira].copy()
-    if sub.empty or "Data" not in sub.columns or "Cota Líquida" not in sub.columns:
-        return out
-
-    sub = sub[["Data", "Cota Líquida"]].dropna().sort_values("Data")
     if sub.empty:
         return out
 
-    series = sub.set_index("Data")["Cota Líquida"]
+    # pega o último registro (mesma data, mas ok)
+    row = sub.sort_values("Data").iloc[-1] if "Data" in sub.columns else sub.iloc[-1]
+
+    for w in windows:
+        col = WINDOW_TO_BACKEND_COL.get(w)
+        if not col or col not in df.columns:
+            out[w] = np.nan
+            continue
+        v = row.get(col, np.nan)
+        out[w] = float(v) if pd.notna(v) else np.nan
+
+    return out
+
+
+# --------------------------
+# Rolling returns - Benchmarks (BACKEND)
+# --------------------------
+def _compute_benchmark_rolling_returns(
+    df_prices: pd.DataFrame,
+    instrument_id: int,
+    periods_dict: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]],
+) -> Dict[str, float]:
+    """Retornos móveis por janela usando a série de Preço do benchmark (as-of)."""
+    out: Dict[str, float] = {k: 0.0 for k in periods_dict.keys()}
+
+    if df_prices is None or df_prices.empty:
+        return out
+
+    sub = df_prices[df_prices["InstrumentID"] == int(instrument_id)].copy()
+    if sub.empty:
+        return out
+
+    sub = sub[["Data", "Preco"]].dropna().sort_values("Data")
+    series = sub.set_index("Data")["Preco"]
     series = series[~series.index.duplicated(keep="last")].sort_index()
     if series.empty:
         return out
@@ -438,67 +416,6 @@ def _compute_portfolio_rolling_returns(
 
 
 # --------------------------
-# Benchmarks
-# --------------------------
-def _calculate_benchmark_returns(periods_dict: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]], benchmark_name: str) -> Dict[str, float]:
-    """
-    Calcula retornos dos benchmarks para janelas móveis.
-    - CDI: usa SELIC meta anual -> taxa diária (aprox) e acumula por dias úteis (mínimo 1).
-    - IMAB11, S&P 500, USD/BRL: usa Yahoo Finance (Close) start->end.
-    """
-    returns: Dict[str, float] = {k: 0.0 for k in periods_dict.keys()}
-
-    try:
-        if benchmark_name == "CDI":
-            cdi_data = _fetch_cdi_data()
-            anual = float(cdi_data.get("selic_meta", 0.0)) / 100.0
-            cdi_daily = (1.0 + anual) ** (1.0 / 252.0) - 1.0
-
-            for k, (ini, fim) in periods_dict.items():
-                bd = int(np.busday_count(ini.date(), fim.date()))
-                bd = max(1, bd)
-                returns[k] = (1.0 + cdi_daily) ** bd - 1.0
-
-        elif benchmark_name == "IMA-B (IMAB11)":
-            if not _HAS_YF:
-                return returns
-            t = yf.Ticker("IMAB11.SA")
-            for k, (ini, fim) in periods_dict.items():
-                hist = t.history(start=ini.date(), end=(fim + pd.Timedelta(days=1)).date())
-                if len(hist) >= 2:
-                    start_price = float(hist["Close"].iloc[0])
-                    end_price = float(hist["Close"].iloc[-1])
-                    returns[k] = (end_price / start_price) - 1.0 if start_price else 0.0
-
-        elif benchmark_name == "S&P 500":
-            if not _HAS_YF:
-                return returns
-            t = yf.Ticker("^GSPC")
-            for k, (ini, fim) in periods_dict.items():
-                hist = t.history(start=ini.date(), end=(fim + pd.Timedelta(days=1)).date())
-                if len(hist) >= 2:
-                    start_price = float(hist["Close"].iloc[0])
-                    end_price = float(hist["Close"].iloc[-1])
-                    returns[k] = (end_price / start_price) - 1.0 if start_price else 0.0
-
-        elif benchmark_name == "USD/BRL":
-            if not _HAS_YF:
-                return returns
-            t = yf.Ticker("USDBRL=X")
-            for k, (ini, fim) in periods_dict.items():
-                hist = t.history(start=ini.date(), end=(fim + pd.Timedelta(days=1)).date())
-                if len(hist) >= 2:
-                    start_price = float(hist["Close"].iloc[0])
-                    end_price = float(hist["Close"].iloc[-1])
-                    returns[k] = (end_price / start_price) - 1.0 if start_price else 0.0
-
-    except Exception as e:
-        st.error(f"Erro ao calcular {benchmark_name}: {e}")
-
-    return returns
-
-
-# --------------------------
 # Comparação (Carteiras + Benchmarks)
 # --------------------------
 def _create_comparison_dataframe(
@@ -507,7 +424,7 @@ def _create_comparison_dataframe(
     selected_benchmarks: List[str],
     selected_windows: List[str],
 ) -> pd.DataFrame:
-    """Cria DataFrame comparativo entre carteiras (Cota Líquida) e benchmarks nas janelas escolhidas."""
+    """Cria DataFrame comparativo entre carteiras (Cota Líquida) e benchmarks (Preço backend) nas janelas escolhidas."""
     if df_perf.empty:
         return pd.DataFrame()
 
@@ -518,56 +435,127 @@ def _create_comparison_dataframe(
     max_dt = pd.to_datetime(df_perf["Data"], errors="coerce").dropna().max()
     periods = _periods(max_dt if pd.notna(max_dt) else pd.Timestamp.now(), windows=windows)
 
+    min_start = min([p[0] for p in periods.values()])
+    max_end = max([p[1] for p in periods.values()])
+
+    selected_ids = [BENCHMARK_NAME_TO_ID[n] for n in selected_benchmarks if n in BENCHMARK_NAME_TO_ID]
+    df_prices = _post_market_prices(
+        start_date=min_start.date(),
+        end_date=max_end.date(),
+        instrument_ids=selected_ids,
+        headers=st.session_state.headers,
+    )
+
     rows = []
 
     for carteira in selected_carteiras:
-        roll = _compute_portfolio_rolling_returns(df_perf, carteira, periods)
+        sub = df_perf[df_perf["Carteira"] == carteira]
+        if sub.empty:
+            continue
+
+        row = sub.sort_values("Data").iloc[-1]
+
         item = {"Nome": carteira, "Tipo": "Carteira"}
         for w in windows:
-            item[w] = float(roll.get(w, 0.0))
+            col = WINDOW_TO_BACKEND_COL.get(w)
+            item[w] = float(row[col]) if col and col in row and pd.notna(row[col]) else np.nan
         rows.append(item)
 
-    for bmk in selected_benchmarks:
-        br = _calculate_benchmark_returns(periods, bmk)
-        item = {"Nome": bmk, "Tipo": "Benchmark"}
+
+    for bmk_name in selected_benchmarks:
+        iid = BENCHMARK_NAME_TO_ID.get(bmk_name)
+        if iid is None:
+            continue
+        br = _compute_benchmark_rolling_returns(df_prices, iid, periods)
+        item = {"Nome": bmk_name, "Tipo": "Benchmark"}
         for w in windows:
             item[w] = float(br.get(w, 0.0))
         rows.append(item)
 
     out = pd.DataFrame(rows)
     for w in windows:
-        out[w] = pd.to_numeric(out[w], errors="coerce").fillna(0.0)
+        out[w] = pd.to_numeric(out[w], errors="coerce")
     return out
 
 
-def _render_summary_table(comparison_df: pd.DataFrame, windows: List[str], sort_window: str):
+# ============================================================
+# RESUMO PARA CLIENTE (SEM TABELA)
+# ============================================================
+
+def _render_client_summary_multi(
+    comparison_df: pd.DataFrame,
+    windows: List[str],
+    sort_window: str,
+    selected_carteiras: List[str],
+    selected_benchmarks: List[str],
+):
     if comparison_df.empty or not windows:
+        st.info("Sem dados para exibir.")
         return
 
-    st.markdown("### Resumo (ranking)")
+    df = comparison_df.copy()
+    for w in windows:
+        df[w] = pd.to_numeric(df[w], errors="coerce")
 
-    df = _safe_numeric(comparison_df, windows).copy()
+    df_c = df[df["Tipo"] == "Carteira"].copy()
+    df_b = df[df["Tipo"] == "Benchmark"].copy()
 
-    # ordena por janela principal
-    if sort_window in windows:
-        df = df.sort_values(by=sort_window, ascending=False)
+    if df_c.empty:
+        st.info("Sem carteiras para exibir.")
+        return
+    if df_b.empty:
+        st.warning("Selecione ao menos 1 benchmark para comparar.")
+        return
 
-    # carteiras primeiro, depois benchmarks
-    df["__ord"] = df["Tipo"].apply(lambda x: 0 if x == "Carteira" else 1)
-    df = df.sort_values(["__ord"] + ([sort_window] if sort_window in windows else []),
-                        ascending=[True] + ([False] if sort_window in windows else []))
-    df = df.drop(columns=["__ord"])
+    # carteira “principal”
+    if len(selected_carteiras) == 1 and selected_carteiras[0] in df_c["Nome"].tolist():
+        carteira_row = df_c[df_c["Nome"] == selected_carteiras[0]].head(1)
+    else:
+        carteira_row = df_c.sort_values(sort_window, ascending=False).head(1)
 
-    show = df[["Nome", "Tipo"] + windows].copy()
-    show_idx = show.set_index(["Tipo", "Nome"])
+    carteira_name = str(carteira_row["Nome"].iloc[0])
+    st.markdown(f"### {carteira_name} vs Benchmarks")
 
-    sty = _style_rank_arrows(show_idx, cols=windows)
-    sty = sty.format({w: (lambda x: _fmt_pct(x)) for w in windows})
-
-    st.dataframe(sty, use_container_width=True)
+    c_val_main = float(carteira_row[sort_window].iloc[0]) if sort_window in carteira_row.columns and pd.notna(carteira_row[sort_window].iloc[0]) else np.nan
 
 
 
+    # UM BLOCO POR BENCHMARK
+    for bmk_name in selected_benchmarks:
+        bmk_row = df_b[df_b["Nome"] == bmk_name].head(1)
+        if bmk_row.empty:
+            continue
+
+        b_val_main = float(bmk_row[sort_window].iloc[0]) if sort_window in bmk_row.columns and pd.notna(bmk_row[sort_window].iloc[0]) else np.nan
+        ex_pp_main = (c_val_main - b_val_main) * 100.0 if pd.notna(c_val_main) and pd.notna(b_val_main) else np.nan
+
+        st.markdown(f"#### Vs {bmk_name}")
+
+
+        # cards por janela (carteira + excesso vs esse benchmark)
+        blocks = [windows[i:i+3] for i in range(0, len(windows), 3)]
+        for blk in blocks:
+            cols = st.columns(len(blk))
+            for i, w in enumerate(blk):
+                c_val = float(carteira_row[w].iloc[0]) if w in carteira_row.columns and pd.notna(carteira_row[w].iloc[0]) else np.nan
+                b_val = float(bmk_row[w].iloc[0]) if w in bmk_row.columns and pd.notna(bmk_row[w].iloc[0]) else np.nan
+                ex_pp = (c_val - b_val) * 100.0 if pd.notna(c_val) and pd.notna(b_val) else np.nan
+
+                cols[i].metric(
+                    label=f"{WINDOW_LABELS.get(w, w)}",
+                    value=_fmt_pct(c_val) if pd.notna(c_val) else "-",
+                    delta=_fmt_pp(ex_pp) if pd.notna(ex_pp) else "",
+                )
+                cols[i].caption(f"{bmk_name}: {_fmt_pct(b_val) if pd.notna(b_val) else '-'}")
+
+        st.divider()
+
+
+
+
+# --------------------------
+# Barras: retorno por janela (mantido)
+# --------------------------
 def _render_performance_bars(comparison_df: pd.DataFrame, windows: List[str]):
     if comparison_df.empty or not windows:
         return
@@ -597,13 +585,16 @@ def _render_performance_bars(comparison_df: pd.DataFrame, windows: List[str]):
     st.plotly_chart(fig, use_container_width=True)
 
 
+# --------------------------
+# Equity curves
+# --------------------------
 def _render_equity_curves(
     df_perf: pd.DataFrame,
     selected_carteiras: List[str],
     benchmark_names: List[str],
     main_window: str
 ):
-    """Equity curve base 100 na janela escolhida."""
+    """Equity curve base 100 na janela escolhida. Benchmarks via backend prices/get."""
     if df_perf.empty or not selected_carteiras:
         return
 
@@ -617,7 +608,6 @@ def _render_equity_curves(
 
     fig = go.Figure()
 
-    # Carteiras
     for carteira in selected_carteiras:
         sub = df_perf[df_perf["Carteira"] == carteira].copy()
         if sub.empty:
@@ -631,53 +621,51 @@ def _render_equity_curves(
         s = s[~s.index.duplicated(keep="last")].sort_index()
         if s.empty:
             continue
+
         base = float(s.iloc[0])
         if base == 0 or pd.isna(base):
             continue
-        eq = (s / base) * 100.0
 
+        eq = (s / base) * 100.0
         fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=f"{carteira}"))
 
-    # Benchmarks
-    if "CDI" in benchmark_names:
-        cdi_data = _fetch_cdi_data()
-        anual = float(cdi_data.get("selic_meta", 0.0)) / 100.0
-        cdi_daily = (1.0 + anual) ** (1.0 / 252.0) - 1.0
-        dates = pd.bdate_range(start=start_ts.date(), end=end_ts.date())
-        if len(dates) > 0:
-            eq = (1.0 + cdi_daily) ** np.arange(len(dates))
-            eq = (eq / eq[0]) * 100.0
-            fig.add_trace(go.Scatter(x=dates, y=eq, mode="lines", name="CDI (aprox)"))
+    selected_ids = [BENCHMARK_NAME_TO_ID[n] for n in benchmark_names if n in BENCHMARK_NAME_TO_ID]
+    df_prices = _post_market_prices(
+        start_date=pd.Timestamp(start_ts).date(),
+        end_date=pd.Timestamp(end_ts).date(),
+        instrument_ids=selected_ids,
+        headers=st.session_state.headers,
+    )
 
-    if _HAS_YF:
-        def _add_yf_curve(symbol: str, name: str):
-            try:
-                t = yf.Ticker(symbol)
-                hist = t.history(start=start_ts.date(), end=(end_ts + pd.Timedelta(days=1)).date())
-                if hist is None or hist.empty or "Close" not in hist.columns:
-                    return
-                s = hist["Close"].dropna()
-                if s.empty:
-                    return
-                base = float(s.iloc[0])
-                if base == 0:
-                    return
-                eq = (s / base) * 100.0
-                fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=name))
-            except Exception:
-                return
+    for name in benchmark_names:
+        iid = BENCHMARK_NAME_TO_ID.get(name)
+        if iid is None:
+            continue
 
-        if "IMA-B (IMAB11)" in benchmark_names:
-            _add_yf_curve("IMAB11.SA", "IMA-B (IMAB11)")
-        if "USD/BRL" in benchmark_names:
-            _add_yf_curve("USDBRL=X", "USD/BRL")
-        if "S&P 500" in benchmark_names:
-            _add_yf_curve("^GSPC", "S&P 500")
+        sub = df_prices[df_prices["InstrumentID"] == int(iid)].copy()
+        if sub.empty:
+            continue
+
+        sub = sub[["Data", "Preco"]].dropna().sort_values("Data")
+        s = sub.set_index("Data")["Preco"]
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        if s.empty:
+            continue
+
+        base = float(s.iloc[0])
+        if base == 0 or pd.isna(base):
+            continue
+
+        eq = (s / base) * 100.0
+        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=name))
 
     fig.update_layout(height=520, xaxis_title="Data", yaxis_title="Base 100", legend_title="Séries")
     st.plotly_chart(fig, use_container_width=True)
 
 
+# --------------------------
+# Detalhe por carteira (mantido)
+# --------------------------
 def _render_detailed_comparison(
     df_perf: pd.DataFrame,
     selected_carteiras: List[str],
@@ -697,31 +685,21 @@ def _render_detailed_comparison(
     periods = _periods(max_dt if pd.notna(max_dt) else pd.Timestamp.now(), windows=windows)
     preferred = "12m" if "12m" in windows else windows[-1]
 
-    for carteira in selected_carteiras:
-        sub = df_perf[df_perf["Carteira"] == carteira].copy()
-        if sub.empty:
-            continue
-
-        st.subheader(carteira)
-        kpis = _compute_portfolio_rolling_returns(df_perf, carteira, periods)
-
-        c1, c2 = st.columns([1.4, 1.0])
-
-        with c1:
-            cols = st.columns(min(4, len(windows)))
-            for i, w in enumerate(windows):
-                with cols[i % len(cols)]:
-                    st.metric(label=w, value=_fmt_pct(kpis.get(w, 0.0)))
-
-        with c2:
-            st.markdown(f"**Vs Benchmarks ({preferred})**")
-            carteira_val = float(kpis.get(preferred, 0.0))
-            for bmk in selected_benchmarks:
-                br = _calculate_benchmark_returns(periods, bmk)
-                diff_pp = (carteira_val - float(br.get(preferred, 0.0))) * 100.0
-                st.metric(label=bmk, value=_fmt_pp(diff_pp))
+    min_start = min([p[0] for p in periods.values()])
+    max_end = max([p[1] for p in periods.values()])
+    selected_ids = [BENCHMARK_NAME_TO_ID[n] for n in selected_benchmarks if n in BENCHMARK_NAME_TO_ID]
+    df_prices = _post_market_prices(
+        start_date=min_start.date(),
+        end_date=max_end.date(),
+        instrument_ids=selected_ids,
+        headers=st.session_state.headers,
+    )
 
 
+
+# --------------------------
+# Auditoria (mantida)
+# --------------------------
 def _create_backend_vs_calculated_df(
     df_perf: pd.DataFrame,
     selected_carteiras: List[str],
@@ -758,7 +736,7 @@ def _create_backend_vs_calculated_df(
             continue
 
         last = sub.iloc[-1]
-        calc = _compute_portfolio_rolling_returns(df_perf, carteira, periods)
+
 
         row: Dict[str, Any] = {"Carteira": carteira, "Data": sub["Data"].max().date()}
 
@@ -768,11 +746,7 @@ def _create_backend_vs_calculated_df(
                 continue
             backend_val = last.get(col, np.nan)
             backend_val = float(backend_val) if pd.notna(backend_val) else np.nan
-            calc_val = float(calc.get(w, np.nan))
 
-            row[f"{w} calc"] = calc_val
-            row[f"{w} back"] = backend_val
-            row[f"{w} diff(pp)"] = (calc_val - backend_val) * 100.0 if pd.notna(calc_val) and pd.notna(backend_val) else np.nan
 
         rows.append(row)
 
@@ -820,31 +794,31 @@ def _render_backend_vs_calculated_pretty(df_perf: pd.DataFrame, selected_carteir
 # Tela – Performance
 # --------------------------
 def tela_performance() -> None:
+    if "df_perf" not in st.session_state:
+        st.session_state.df_perf = pd.DataFrame()
+
     if "headers" not in st.session_state or not st.session_state.headers:
         st.warning("Faça login para consultar os dados.")
         return
-
+    df = st.session_state.get("df_perf", pd.DataFrame())
+    
     st.markdown("### Performance de Carteiras")
-
-    _display_indicators()
     st.divider()
 
     with st.container():
-        c_f1, c_f2, c_f3, c_f4, c_f5 = st.columns([1.2, 2.2, 1.4, 1.6, 1.0])
+        c_f1, c_f2, c_f3,  c_f5 = st.columns([1.2, 2.2, 1.4, 1.0])
 
         with c_f1:
             st.markdown("**Janela de Consulta (dados brutos)**")
-            janela = st.date_input(
-                "",
-                value=[date.today() - timedelta(days=800), date.today()],
-                key="perf_janela",
-                label_visibility="collapsed"
-            )
-            if isinstance(janela, list) and len(janela) == 2:
-                d_ini, d_fim = janela
-            else:
-                d_ini = date.today() - timedelta(days=800)
-                d_fim = date.today()
+            d_ref = st.date_input(
+            "",
+            value=date.today(),
+            key="perf_data_ref",
+            label_visibility="collapsed",
+        )
+        d_ini = d_ref
+        d_fim = d_ref
+
 
         with c_f2:
             st.markdown("**Carteiras**")
@@ -857,39 +831,66 @@ def tela_performance() -> None:
             )
 
         with c_f3:
-            st.markdown("**Benchmarks**")
+            st.markdown("**Benchmarks (backend)**")
             bmarks = st.multiselect(
                 "",
-                ["CDI", "IMA-B (IMAB11)", "USD/BRL", "S&P 500"],
-                default=["CDI", "IMA-B (IMAB11)"],
+                options=list(BENCHMARK_NAME_TO_ID.keys()),
+                default=["CDI", "IMAB"],
                 key="perf_bmarks",
                 label_visibility="collapsed"
             )
 
-        with c_f4:
-            st.markdown("**Janelas**")
-            selected_windows = st.multiselect(
-                "",
-                options=WINDOW_ORDER,
-                default=["1m", "3m", "6m", "12m"],
-                format_func=lambda w: f"{w} — {WINDOW_LABELS.get(w, w)}",
-                key="perf_windows",
-                label_visibility="collapsed",
-            )
+
 
         with c_f5:
             st.markdown(" ")
             carregar = st.button("Buscar", key="perf_btn_carregar", use_container_width=True)
 
     carteiras_ids = [k for k, v in CARTEIRAS.items() if v in carteiras_nomes]
+    windows = st.session_state.get("selected_windows", ["1m","3m","6m","12m", "ano", "dia"])
+    windows = [w for w in WINDOW_ORDER if w in set(windows)]
+    # mapeamento janela -> coluna do df do backend
+    WINDOW_TO_BACKEND_COL = {
+        "1m": "%Mês",
+        "6m": "%6 Meses",
+        "12m": "%12 Meses",
+        "18m": "%18 Meses",
+        "24m": "%24 Meses",
+        "ano": "%Ano",
+        "dia": "%Dia"
+    }
+
+    # carteira base = primeira selecionada
+    carteira_base = st.session_state.get("selected_carteiras", [])
+    carteira_base = carteira_base[0] if carteira_base else None
+
+    windows_filtradas = []
+
+    if carteira_base:
+        sub = df[df.get("Carteira") == carteira_base] if "Carteira" in df.columns else pd.DataFrame()
+        if not sub.empty:
+            # pega a última linha (mais recente)
+            row = sub.sort_values("Data").iloc[-1] if "Data" in sub.columns else sub.iloc[-1]
+
+            for w in windows:
+                col = WINDOW_TO_BACKEND_COL.get(w)
+                if not col or col not in df.columns:
+                    continue
+
+                val = row.get(col, np.nan)
+
+                # >>> FILTRO: só entra se NÃO for NaN
+                if pd.notna(val):
+                    windows_filtradas.append(w)
+
+    windows = windows_filtradas
+
 
     if carregar:
         if not carteiras_ids:
             st.error("Selecione ao menos uma carteira.")
             return
-        if not selected_windows:
-            st.error("Selecione ao menos uma janela de performance.")
-            return
+
 
         try:
             with st.spinner("Buscando dados das carteiras..."):
@@ -902,7 +903,7 @@ def tela_performance() -> None:
             st.session_state.df_perf = df
             st.session_state.selected_carteiras = carteiras_nomes
             st.session_state.selected_benchmarks = bmarks
-            st.session_state.selected_windows = [w for w in WINDOW_ORDER if w in set(selected_windows)]
+            st.session_state.selected_windows = [w for w in WINDOW_ORDER if w in set(windows)]
             st.success("Dados carregados com sucesso!")
 
         except Exception as e:
@@ -912,13 +913,11 @@ def tela_performance() -> None:
     if "df_perf" not in st.session_state or st.session_state.df_perf.empty:
         st.info("Selecione carteiras, benchmarks e janelas e clique em Buscar.")
         return
+    print(df)
 
-    df = st.session_state.df_perf
-    windows = st.session_state.get("selected_windows", ["1m", "3m", "6m", "12m"])
+    windows = ["1m", "3m", "6m", "12m"]
     windows = [w for w in WINDOW_ORDER if w in set(windows)]
-    if not windows:
-        st.warning("Selecione ao menos uma janela.")
-        return
+
 
     comparison_df = _create_comparison_dataframe(
         df,
@@ -931,16 +930,18 @@ def tela_performance() -> None:
         st.info("Sem dados para exibir.")
         return
 
-    main_window = st.selectbox(
-        "Janela principal (ranking e destaque)",
-        options=windows,
-        index=windows.index("12m") if "12m" in windows else len(windows) - 1
-    )
+    main_window = windows[0]
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Resumo", "Gráficos", "Detalhe", "Auditoria", "Bruto"])
+    tab1, tab2 = st.tabs(["Resumo", "Gráficos"])
 
     with tab1:
-        _render_summary_table(comparison_df, windows, sort_window=main_window)
+        _render_client_summary_multi(
+            comparison_df=comparison_df,
+            windows=windows,
+            sort_window=main_window,
+            selected_carteiras=st.session_state.get("selected_carteiras", []),
+            selected_benchmarks=st.session_state.get("selected_benchmarks", []),
+        )
 
     with tab2:
         _render_performance_bars(comparison_df, windows)
@@ -952,25 +953,3 @@ def tela_performance() -> None:
             main_window=main_window
         )
 
-    with tab3:
-        _render_detailed_comparison(
-            df,
-            st.session_state.get("selected_carteiras", []),
-            st.session_state.get("selected_benchmarks", []),
-            windows
-        )
-
-    with tab4:
-        _render_backend_vs_calculated_pretty(
-            df,
-            st.session_state.get("selected_carteiras", []),
-            windows
-        )
-
-    with tab5:
-        cols = ["Carteira", "Data", "Cota Líquida", "%Dia", "%Mês", "%Ano", "%12 Meses", "%18 Meses", "%24 Meses"]
-        cols = [c for c in cols if c in df.columns]
-        display_df = df[cols].copy()
-        for col in [c for c in cols if c.startswith("%")]:
-            display_df[col] = display_df[col].apply(lambda x: _fmt_pct(x) if pd.notna(x) else "")
-        st.dataframe(display_df.sort_values(["Carteira", "Data"]), use_container_width=True)

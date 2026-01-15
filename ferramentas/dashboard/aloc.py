@@ -4,6 +4,14 @@ import requests
 import streamlit as st
 import pandas as pd
 from utils import BASE_URL_API, CARTEIRAS
+from ferramentas.dashboard.metricas_dash import (
+    ativos_renda_var,
+    exposicao_bruta_rv_brasil,
+    hedge_indice,
+    exposicao_bruta_rv_global,
+    hedge_sp500,
+    hedge_dol,
+)
 
 # ===== Configs =====
 PIZZA_LIMIAR_OUTROS = 0.02  # classes com <2% vão para "Outros"
@@ -159,122 +167,117 @@ def _calcular_metricas_gestao(overview: dict, df_positions: pd.DataFrame) -> dic
     df = df_positions.copy()
 
     PL = _to_float(overview.get("net_asset_value", 0))
-    equity_exposure = _to_float(overview.get("equity_exposure", 0))
-    enquadramento_rv = (equity_exposure / PL * 100) if PL else 0.0
 
-    # valor com sinal (gabarito exige isso)
+    # =========================
+    # Colunas básicas
+    # =========================
     value_col = _pick_first_existing(df, ["exposure_value", "last_exposure_value"])
     if value_col is None:
-        return {"_erro": "Sem exposure_value. O gabarito exige valor com sinal.", "PL": PL}
+        return {"_erro": "Sem exposure_value/last_exposure_value. Preciso do valor com sinal.", "PL": PL}
 
     df["val"] = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
 
-    # moeda (câmbio)
-    currency_id_col = _pick_first_existing(df, ["original_currency_id", "currency_id", "instrument_currency_id"])
-    if currency_id_col is not None:
-        df["currency"] = df[currency_id_col].map(CURRENCY_ID_MAP).fillna(df[currency_id_col].astype(str))
+    if "book_name" not in df.columns:
+        df["book_name"] = ""
+    df["book_l"] = df["book_name"].astype(str).str.strip().str.lower()
+
+    name_col = _pick_first_existing(df, ["instrument_name", "name", "instrument", "description", "ticker_description"])
+    if name_col is None:
+        df["name_l"] = ""
     else:
-        df["currency"] = "BRL"
+        df["name_l"] = df[name_col].astype(str).str.strip().str.lower()
 
-    # book_name (único critério)
-    df["book_l"] = df.get("book_name", "").astype(str).str.lower()
+    # =========================
+    # Normalização das regras
+    # =========================
+    ativos_rv_set = {str(x).strip().lower() for x in (ativos_renda_var or [])}
 
-    # ============================================================
-    # BRASIL (NOVA REGRA): tudo em RV Brasil menos índice/futuros/opções/hedge
-    # ============================================================
-    rv_br_all = _contains_any(df["book_l"], ["renda variável brasil", "renda variavel brasil"])
+    book_rv_br_fundos = str(exposicao_bruta_rv_brasil).strip().lower()
+    books_hedge_indice_br = [str(x).strip().lower() for x in (hedge_indice or [])]
 
-    KW_IDX_BR = [
-        "índice", "indice",
-        "hedge",
-        "futuro", "futuros",
-        "opção", "opções", "opcao", "opcoes",
-        "ibov", "ibovespa", "win",
-    ]
-    idx_br = rv_br_all & _contains_any(df["book_l"], KW_IDX_BR)
+    books_rv_global = [str(x).strip().lower() for x in (exposicao_bruta_rv_global or [])]
+    book_hedge_sp500 = str(hedge_sp500).strip().lower()
 
-    rv_br_base = rv_br_all & (~idx_br)
+    book_hedge_dol = str(hedge_dol).strip().lower()
 
-    exp_bruta_rv_br = float(df.loc[rv_br_base, "val"].abs().sum())
+    # =========================
+    # 1) ENQUADRAMENTO RV (%)  -> por NOMES (lista)
+    # =========================
+    # regra: soma ABS das posições cujos nomes estejam na lista
+    # (se quiser com sinal, troco para .sum() em vez de .abs().sum())
+    mask_enq_rv = df["name_l"].isin(ativos_rv_set)
+    equity_exposure_lista = float(df.loc[mask_enq_rv, "val"].abs().sum())
+    enquadramento_rv = (equity_exposure_lista / PL * 100) if PL else 0.0
+
+    # =========================
+    # 2) RV BRASIL -> por BOOK (SEM filtro por nome)
+    # =========================
+    rv_br_book = df["book_l"].eq(book_rv_br_fundos)
+    idx_br = df["book_l"].isin(books_hedge_indice_br)
+
+    exp_bruta_rv_br = float(df.loc[rv_br_book, "val"].abs().sum())
     hedge_indice_br = float(df.loc[idx_br, "val"].sum())
     exp_liq_rv_br = exp_bruta_rv_br + hedge_indice_br
 
-    # ============================================================
-    # GLOBAL (REGRA ANTERIOR): listas explícitas (como você disse que estava certo)
-    # ============================================================
-    BOOK_RV_GL = [
-        "renda variável offshore >> etfs",
-        "renda variavel offshore >> etfs",
-        "renda variável offshore >> ações",
-        "renda variavel offshore >> acoes",
-        "renda variável offshore >> etf",
-        "renda variavel offshore >> etf",
-    ]
+    # =========================
+    # 3) RV GLOBAL -> por BOOK
+    # =========================
+    rv_gl_book = df["book_l"].isin(books_rv_global)
+    idx_gl = df["book_l"].eq(book_hedge_sp500)
 
-    BOOK_IDX_GL = [
-        "renda variável offshore >> índice",
-        "renda variavel offshore >> indice",
-        "hedge ações globais",
-        "hedge acoes globais",
-    ]
-
-    rv_gl_base = _contains_any(df["book_l"], BOOK_RV_GL)
-    idx_gl = _contains_any(df["book_l"], BOOK_IDX_GL)
-
-    exp_bruta_rv_gl = float(df.loc[rv_gl_base & ~idx_gl, "val"].abs().sum())
+    exp_bruta_rv_gl = float(df.loc[rv_gl_book, "val"].abs().sum())
     hedge_indice_gl = float(df.loc[idx_gl, "val"].sum())
     exp_liq_rv_gl = exp_bruta_rv_gl + hedge_indice_gl
 
-    # ============================================================
-    # HEDGE DÓLAR (g): somente por book + % Exposição
-    # ============================================================
-    BOOK_HEDGE_DOL = [
-        "moedas >> futuros",
-        "câmbio",
-        "cambio",
-        "fx",
-        "hedge moedas",
-    ]
+    # =========================
+    # 4) HEDGE DÓLAR -> por BOOK (e % por PL com chave compatível)
+    # =========================
+    hedge_dol_mask = df["book_l"].eq(book_hedge_dol)
+    hedge_dol_val = float(df.loc[hedge_dol_mask, "val"].sum())
+    hedge_dol_pct_pl = (hedge_dol_val / PL * 100) if PL else 0.0
 
+    # pct API (opcional)
+    hedge_dol_pct_api = None
+    if "pct_asset_value" in df.columns:
+        hedge_dol_pct_api = _pct_from_series_sum(df.loc[hedge_dol_mask, "pct_asset_value"])
 
-    hedge_dol_mask = _contains_any(df["book_l"], BOOK_HEDGE_DOL)
+    # Moedas >> Outros (se você quiser manter)
     outros = _contains_any(df["book_l"], ["moedas >> outros"])
-    hedge_dol = float(df.loc[hedge_dol_mask, "val"].sum())
+    moedas_outros = float(df.loc[outros, "val"].sum())
 
-    if "pct_asset_value" not in df.columns:
-        raise ValueError("pct_asset_value não veio na API. Sem isso NÃO dá para calcular % Exposição do Hedge DOL.")
-    hedge_dol_pct = _pct_from_series_sum(df.loc[hedge_dol_mask, "pct_asset_value"])
-
-    # Net Dólar (aproximação API-only: Global líquido + hedge dol + USD fora do book global)
-    moedas_outros =  float(df.loc[outros, "val"].sum())
-    print("AAAAAAAAAAAAAAAAAAAAAAAAAAA")
-    print (moedas_outros)
-    print("BBBBBBBBBBBBBBBBBBBBBBBBBBB")
-    net_dolar = exp_bruta_rv_gl + hedge_dol + moedas_outros
+    net_dolar = exp_bruta_rv_gl + hedge_dol_val + moedas_outros
     net_dolar_pct = (net_dolar / PL * 100) if PL else 0.0
 
-    def pct_pl(x):
+    def pct_pl(x: float) -> float:
         return (x / PL * 100) if PL else 0.0
 
     return {
         "PL": PL,
-        "Enquadramento RV (%)": enquadramento_rv,
 
+        # Enquadramento por nomes
+        "Enquadramento RV (%)": enquadramento_rv,
+        "_enq_rv_val_lista": equity_exposure_lista,  # debug: total em R$ da lista
+
+        # RV BR por book
         "Exp. Bruta RV Brasil": exp_bruta_rv_br,
         "HEDGE ÍNDICE BR": hedge_indice_br,
         "Exp. Líquida RV Brasil": exp_liq_rv_br,
 
+        # RV Global por book
         "Exp. Bruta RV Global": exp_bruta_rv_gl,
         "HEDGE ÍNDICE Global": hedge_indice_gl,
         "Exp. Líquida RV Global": exp_liq_rv_gl,
 
-        "HEDGE DOL": hedge_dol,
-        "HEDGE DOL %": pct_pl(hedge_dol),
+        # Hedge Dólar (compatível com UI)
+        "HEDGE DOL": hedge_dol_val,
+        "HEDGE DOL %": hedge_dol_pct_pl,
+        "HEDGE DOL % (API pct_asset_value)": hedge_dol_pct_api,
 
+        # Net dólar
         "Net Dólar": net_dolar,
         "Net Dólar %": net_dolar_pct,
 
-        # percentuais (por PL) para RV
+        # percentuais por PL
         "Exp. Bruta RV Brasil %": pct_pl(exp_bruta_rv_br),
         "HEDGE ÍNDICE BR %": pct_pl(hedge_indice_br),
         "Exp. Líquida RV Brasil %": pct_pl(exp_liq_rv_br),
@@ -284,14 +287,23 @@ def _calcular_metricas_gestao(overview: dict, df_positions: pd.DataFrame) -> dic
         "Exp. Líquida RV Global %": pct_pl(exp_liq_rv_gl),
 
         "_value_col": value_col,
-        "_currency_col": currency_id_col,
+        "_name_col": name_col,
     }
+
+def _normalize_pct_asset_value(df: pd.DataFrame) -> pd.Series:
+    pct = pd.to_numeric(df.get("pct_asset_value", 0), errors="coerce").fillna(0.0)
+    # se vier como fração (0-1), converte para %
+    if pct.abs().max() <= 1.5:
+        pct = pct * 100.0
+    return pct
 
 
 # =========================
 # Tela principal
 # =========================
 def tela_alocacao():
+    
+
     st.header("Alocação por Classe de Ativo")
 
     if "headers" not in st.session_state or not st.session_state.headers:
@@ -337,6 +349,7 @@ def tela_alocacao():
             resultado = resp.json()
 
         objetos = resultado.get("objects", {})
+        
         inst_positions = []
         overviews = []
 
@@ -346,6 +359,7 @@ def tela_alocacao():
                 continue
             overviews.append(obj)
             pos = obj.get("instrument_positions")
+
             if isinstance(pos, list):
                 inst_positions.extend(pos)
             elif isinstance(pos, dict):
@@ -368,12 +382,12 @@ def tela_alocacao():
         st.error(metricas["_erro"])
         return
 
-    st.subheader("Métricas de Gestão (gabarito)")
+    st.subheader("Métricas de Gestão")
     c1, c2, c3 = st.columns(3)
 
     with c1:
         st.metric("PL", f"R$ {_fmt_brl(metricas['PL'])}")
-        st.metric("Nível RV (oficial)", f"{metricas['Enquadramento RV (%)']:.1f}%")
+        st.metric("Enquadramento RV", f"{metricas['Enquadramento RV (%)']:.1f}%")
 
     with c2:
         st.metric("Exp. Bruta RV Brasil", f"R$ {_fmt_brl(metricas['Exp. Bruta RV Brasil'])}  ({metricas['Exp. Bruta RV Brasil %']:.1f}%)")
@@ -411,7 +425,7 @@ def tela_alocacao():
         .rename(columns={"book_name": "Classe"})
         .drop(columns=["asset_value", "pct"])
     )
-    st.dataframe(tabela_resumo, use_container_width=True, hide_index=True)
+ 
 
     agg_pizza = _consolidar_outros(agg, limiar=PIZZA_LIMIAR_OUTROS)
     st.plotly_chart(_fig_pizza(agg_pizza), use_container_width=True)
