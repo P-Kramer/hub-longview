@@ -344,7 +344,8 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
         # aplica no ativo
         if exists:
             df.loc[filtro, "asset_value"] = df.loc[filtro, "asset_value"] + delta
-            df.loc[filtro, value_col] = df.loc[filtro, value_col] + delta
+            # NÃO ajustar exposure_value aqui
+
         else:
             raise ValueError(
                 "Ativo não encontrado para aplicar movimento.\n"
@@ -354,7 +355,8 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
 
         # contrapartida no caixa: cash = cash - delta
         df.at[cash_idx, "asset_value"] = float(df.at[cash_idx, "asset_value"]) - delta
-        df.at[cash_idx, value_col] = float(df.at[cash_idx, value_col]) - delta
+        # NÃO ajustar exposure_value do caixa
+
 
     # limpa linhas quase zeradas
     df["asset_value"] = pd.to_numeric(df["asset_value"], errors="coerce").fillna(0.0)
@@ -664,6 +666,14 @@ def tela_simulacao() -> None:
     with colR:
         try:
             df_depois = _aplicar_movimentos_rebalance(df_antes, movimentos) if movimentos else df_antes.copy()
+                    # DEBUG: prova que o DF está mudando de verdade
+            st.write("DEBUG | sum(asset_value) antes:", float(df_antes["asset_value"].sum()))
+            st.write("DEBUG | sum(asset_value) depois:", float(df_depois["asset_value"].sum()))
+
+            if value_col:
+                st.write("DEBUG | sum(exposure) antes:", float(pd.to_numeric(df_antes[value_col], errors="coerce").fillna(0.0).sum()))
+                st.write("DEBUG | sum(exposure) depois:", float(pd.to_numeric(df_depois[value_col], errors="coerce").fillna(0.0).sum()))
+
         except RuntimeError as re:
             if str(re) == "CASH_NOT_FOUND":
                 _guide_cash_mask_message()

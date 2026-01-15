@@ -27,7 +27,7 @@ def render(ctx=None):
     with col2:
         st.markdown("📊 Planilha COMDINHEIRO (.xlsx)")
         excel_file = st.file_uploader("", type=["xlsx", "xls"], key="excel")
-        st.caption("Colunas necessárias: Carteira, Ativo, Descrição, Quant., Saldo Bruto, Classe, ticker_cmd_puro")
+        st.caption("Colunas necessárias: Carteira, Ativo, Descrição, Quant., Saldo Bruto, minha_variavel(class), ticker_cmd_puro")
 
     st.divider()
     st.subheader("Critérios de Divergências")

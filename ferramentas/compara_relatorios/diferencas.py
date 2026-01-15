@@ -116,7 +116,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
         df = _ensure_cols(
             df,
             {
-                "Classe": None,
+                "minha_variavel(class)": None,
                 "Ativo": "",
                 "Quant.": np.nan,
                 "Saldo Bruto": np.nan,
@@ -125,13 +125,13 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
             },
         )
 
-        df = df[df["Classe"].isin(["EQUITY", "FIXED INCOME", "FLOATING INCOME", "HEDGE FUND"])].copy()
+        df = df[df["minha_variavel(class)"].isin(["EQUITY", "FIXED INCOME", "FLOATING INCOME", "HEDGE FUND", "CURRENCY"])].copy()
         df = df.rename(columns={"Ativo": "Ticker", "Quant.": "Quantidade", "Saldo Bruto": "MarketValue"})
 
         # ticker_cmd_puro pode não existir / vir vazio -> TickerBase vazio
         df["TickerBase"] = df["ticker_cmd_puro"].astype(str).str.split(":").str[-1].str.strip()
 
-        return df[["Descrição", "Ticker", "TickerBase", "Quantidade", "MarketValue", "Classe"]]
+        return df[["Descrição", "Ticker", "TickerBase", "Quantidade", "MarketValue", "minha_variavel(class)"]]
 
     def processar_ativos(df):
         df = df.copy()
@@ -180,7 +180,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                         "Descrição_CD": row_cd["Descrição"],
                         "Ticker_CD": row_cd["Ticker"],
                         "TickerBase": row_cd["TickerBase"],
-                        "Classe": row_cd["Classe"],
+                        "minha_variavel(class)": row_cd["minha_variavel(class)"],
                         "Quantidade_CD": row_cd["Quantidade"],
                         "MarketValue_CD": row_cd["MarketValue"],
                         "Nome_MS": row_at["Nome"],
@@ -225,7 +225,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                         "Descrição_CD": row_cd["Descrição"],
                         "Ticker_CD": row_cd["Ticker"],
                         "TickerBase": row_cd["TickerBase"],
-                        "Classe": row_cd["Classe"],
+                        "minha_variavel(class)": row_cd["minha_variavel(class)"],
                         "Quantidade_CD": row_cd["Quantidade"],
                         "MarketValue_CD": row_cd["MarketValue"],
                         "Nome_MS": row_at["Nome"],
@@ -266,7 +266,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
             "Descrição_CD": r["Descrição"],
             "Ticker_CD": r["Ticker_CD"],
             "TickerBase": r["TickerBase"],
-            "Classe": r["Classe"],
+            "minha_variavel(class)": r["minha_variavel(class)"],
             "Quantidade_CD": r["Quantidade_CD"],
             "MarketValue_CD": r["MarketValue_CD"],
             "Nome_MS": r["Nome"],
@@ -303,7 +303,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                         "Descrição_CD": row["Descrição"],
                         "Ticker_CD": row["Ticker"],
                         "TickerBase": row["TickerBase"],
-                        "Classe": row["Classe"],
+                        "minha_variavel(class)": row["minha_variavel(class)"],
                         "Quantidade_CD": row["Quantidade"],
                         "MarketValue_CD": row["MarketValue"],
                         "Nome_MS": m["Nome"],
@@ -338,7 +338,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                         "Descrição_CD": row["Descrição"],
                         "Ticker_CD": row["Ticker"],
                         "TickerBase": row["TickerBase"],
-                        "Classe": row["Classe"],
+                        "minha_variavel(class)": row["minha_variavel(class)"],
                         "Quantidade_CD": row["Quantidade"],
                         "MarketValue_CD": row["MarketValue"],
                         "Nome_MS": m["Nome"],
@@ -385,7 +385,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                         "Descrição_CD": row_cd["Descrição"],
                         "Ticker_CD": row_cd["Ticker"],
                         "TickerBase": row_cd["TickerBase"],
-                        "Classe": row_cd["Classe"],
+                        "minha_variavel(class)": row_cd["minha_variavel(class)"],
                         "Quantidade_CD": row_cd["Quantidade"],
                         "MarketValue_CD": row_cd["MarketValue"],
                         "Nome_MS": m["Nome"],
@@ -423,7 +423,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                         "Descrição_CD": row_cd["Descrição"],
                         "Ticker_CD": row_cd["Ticker"],
                         "TickerBase": row_cd["TickerBase"],
-                        "Classe": row_cd["Classe"],
+                        "minha_variavel(class)": row_cd["minha_variavel(class)"],
                         "Quantidade_CD": row_cd["Quantidade"],
                         "MarketValue_CD": row_cd["MarketValue"],
                         "Nome_MS": m["Nome"],
@@ -483,7 +483,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                     "Descrição_CD": row_cd["Descrição"],
                     "Ticker_CD": row_cd["Ticker"],
                     "TickerBase": row_cd["TickerBase"],
-                    "Classe": row_cd["Classe"],
+                    "minha_variavel(class)": row_cd["minha_variavel(class)"],
                     "Quantidade_CD": row_cd["Quantidade"],
                     "MarketValue_CD": row_cd["MarketValue"],
                     "Nome_MS": m["Nome"],
@@ -521,7 +521,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
                     "Descrição_CD": row_cd["Descrição"],
                     "Ticker_CD": row_cd["Ticker"],
                     "TickerBase": row_cd["TickerBase"],
-                    "Classe": row_cd["Classe"],
+                    "minha_variavel(class)": row_cd["minha_variavel(class)"],
                     "Quantidade_CD": row_cd["Quantidade"],
                     "MarketValue_CD": row_cd["MarketValue"],
                     "Nome_MS": m["Nome"],
@@ -600,7 +600,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
         "MarketValue_MS",
         "Diff_MarketValue",
         "Pct_Diff_MarketValue",
-        "Classe",
+        "minha_variavel(class)",
     ]
     if not all_matches.empty:
         for c in col_order:
@@ -638,7 +638,7 @@ def checar_divergencias(df_at, df_cd, diff_pct_max, diff_mv_max):
     if not all_matches.empty:
         diff_mv_col = col_order.index("Diff_MarketValue") + 1
         pct_diff_mv_col = col_order.index("Pct_Diff_MarketValue") + 1
-        classe_col = col_order.index("Classe") + 1
+        classe_col = col_order.index("minha_variavel(class)") + 1
 
         for idx, row in enumerate(ws_pareados.iter_rows(min_row=2, max_row=ws_pareados.max_row), start=2):
             diff_mv = ws_pareados.cell(row=idx, column=diff_mv_col).value
