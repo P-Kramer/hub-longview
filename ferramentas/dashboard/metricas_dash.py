@@ -35,5 +35,6 @@ hedge_sp500 = "Renda Variável Offshore >> Índice"
 # Hedge Dólar (book)
 hedge_dol = "Moedas >> Futuros"
 
+caixa = ["USD", "BRL" , "TESOURO SELIC", "LFT"]
 
 

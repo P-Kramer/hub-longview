@@ -11,11 +11,13 @@ import streamlit as st
 import pandas as pd
 
 from utils import BASE_URL_API, CARTEIRAS
+from .metricas_dash import caixa as caixa_ativos
+from .aloc import _calcular_metricas_gestao
 
 # ======================================================
 # AJUSTE ESTE IMPORT PARA O SEU ARQUIVO REAL DE MÉTRICAS
 # ======================================================
-from .aloc import _calcular_metricas_gestao  # <-- AJUSTE AQUI
+
 
 PIZZA_LIMIAR_OUTROS = 0.02  # classes <2% viram "Outros"
 
@@ -95,20 +97,31 @@ def _fmt_ptbr_currency(v: float) -> str:
         return "0,00"
 
 
-def _guess_cash_mask(df: pd.DataFrame) -> pd.Series:
-    """
-    Ajuste esta heurística para o seu caixa real.
-    """
-    book = df.get("book_name", "").astype(str).str.lower()
-    inst = df.get("instrument_name", "").astype(str).str.lower()
+def _guess_cash_mask(df: pd.DataFrame, caixa_ativos: list[str]) -> pd.Series:
+    book = df.get("book_name", "").astype(str).str.lower().str.strip()
+    inst = df.get("instrument_name", "").astype(str).str.lower().str.strip()
+
+    mask = pd.Series(False, index=df.index)
+
+    termos = [str(t).strip().lower() for t in (caixa_ativos or []) if str(t).strip()]
+    for t in termos:
+        if len(t) <= 3:  # usd, brl
+            # palavra inteira
+            mask |= inst.str.contains(rf"\b{re.escape(t)}\b", regex=True, na=False)
+        else:
+            # contém
+            mask |= inst.str.contains(re.escape(t), regex=True, na=False)
+
     keywords = [
         "caixa", "cash", "liquidez", "conta corrente", "saldo",
         "disponível", "disponivel", "cash management"
     ]
-    mask = pd.Series(False, index=df.index)
     for k in keywords:
         mask |= book.str.contains(k, na=False) | inst.str.contains(k, na=False)
+
     return mask
+
+
 
 
 def _recalc_pct_asset_value(df: pd.DataFrame) -> pd.DataFrame:
@@ -128,7 +141,7 @@ def _get_cash_available(df: pd.DataFrame) -> float:
     Caixa disponível (líquido) em R$.
     Se seu caixa estiver distribuído em múltiplas linhas, soma tudo.
     """
-    cash_mask = _guess_cash_mask(df)
+    cash_mask = _guess_cash_mask(df, caixa_ativos)
     if not cash_mask.any():
         raise RuntimeError("CASH_NOT_FOUND")
     return float(pd.to_numeric(df.loc[cash_mask, "asset_value"], errors="coerce").fillna(0.0).sum())
@@ -318,7 +331,7 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
     df[value_col] = pd.to_numeric(df.get(value_col, 0), errors="coerce").fillna(0.0)
 
     # identifica caixa (pega o MAIOR, não o primeiro)
-    cash_mask = _guess_cash_mask(df)
+    cash_mask = _guess_cash_mask(df, caixa_ativos)
     if not cash_mask.any():
         raise RuntimeError("CASH_NOT_FOUND")
 
@@ -412,19 +425,14 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
 # AGG / EXCEL
 # ======================================================
 def _agg_por_classe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pizza = alocação BRUTA (ABS) e fecha 100%.
-    Exclui CAIXA.
-    """
     if df.empty:
         return pd.DataFrame(columns=["book_name", "asset_value", "pct"])
 
     tmp = df.copy()
     tmp["asset_value"] = pd.to_numeric(tmp.get("asset_value", 0), errors="coerce").fillna(0.0)
 
-    book_l = tmp.get("book_name", "").astype(str).str.lower()
-    is_cash = book_l.str.contains("caixa", na=False) | book_l.str.contains("cash", na=False)
-    tmp = tmp.loc[~is_cash].copy()
+    cash_mask = _guess_cash_mask(tmp, caixa_ativos)
+    tmp = tmp.loc[~cash_mask].copy()
 
     tmp["asset_value_abs"] = tmp["asset_value"].abs()
     agg = tmp.groupby("book_name", as_index=False)["asset_value_abs"].sum()
@@ -432,8 +440,8 @@ def _agg_por_classe(df: pd.DataFrame) -> pd.DataFrame:
 
     total = float(agg["asset_value"].sum())
     agg["pct"] = (agg["asset_value"] / total) if total else 0.0
-
     return agg.sort_values("asset_value", ascending=False).reset_index(drop=True)
+
 
 
 def _excel_simulacao(
@@ -609,18 +617,9 @@ def _render_metricas_resumo(m_before: dict, m_after: dict):
 
 def _df_sem_caixa(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    book_l = df.get("book_name", "").astype(str).str.lower()
-    inst_l = df.get("instrument_name", "").astype(str).str.lower()
+    cash_mask = _guess_cash_mask(df, caixa_ativos)
+    return df.loc[~cash_mask].copy()
 
-    is_cash = (
-        book_l.str.contains("caixa", na=False) |
-        book_l.str.contains("cash", na=False) |
-        inst_l.str.contains("caixa", na=False) |
-        inst_l.str.contains("cash", na=False) |
-        inst_l.str.contains("saldo", na=False) |
-        inst_l.str.contains("conta corrente", na=False)
-    )
-    return df.loc[~is_cash].copy()
 
 # ======================================================
 # PAGE
