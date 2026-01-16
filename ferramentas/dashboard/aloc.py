@@ -205,6 +205,7 @@ REGRAS_ALOCACAO = {
         ],
         "book_name": [
             "Renda Variável Brasil >> Fundos",
+            "Renda Variável Brasil >> Ações"
 
         ],
     },
@@ -990,6 +991,7 @@ def tela_alocacao():
 
     with col_tbl:
         render_relatorio_excel_style(rows, "Tabela por Seções")
+
 
     xls = gerar_excel_alocacao(rows)
 
