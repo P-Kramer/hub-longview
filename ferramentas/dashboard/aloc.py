@@ -15,29 +15,124 @@ from ferramentas.dashboard.metricas_dash import (
     hedge_dol,
     caixa
 )
-def _guess_cash_mask(df: pd.DataFrame, caixa_ativos: list[str]) -> pd.Series:
-    book = df.get("book_name", "").astype(str).str.lower().str.strip()
-    inst = df.get("instrument_name", "").astype(str).str.lower().str.strip()
+def gerar_excel_alocacao(rows: list[dict]) -> bytes:
+    import pandas as pd
+    import io
 
-    mask = pd.Series(False, index=df.index)
+    # -----------------------------
+    # DataFrame base
+    # -----------------------------
+    df = pd.DataFrame([
+        {
+            "Ativo": r["ativo"],
+            "Financeiro": float(r["financeiro"]),
+            "%": float(r["pct"]) / 100.0,  # Excel usa fração
+        }
+        for r in rows
+    ])
 
-    termos = [str(t).strip().lower() for t in (caixa_ativos or []) if str(t).strip()]
-    for t in termos:
-        if len(t) <= 3:  # usd, brl
-            # palavra inteira
-            mask |= inst.str.contains(rf"\b{re.escape(t)}\b", regex=True, na=False)
-        else:
-            # contém
-            mask |= inst.str.contains(re.escape(t), regex=True, na=False)
+    row_kinds = [r["tipo"] for r in rows]
 
-    keywords = [
-        "caixa", "cash", "liquidez", "conta corrente", "saldo",
-        "disponível", "disponivel", "cash management"
-    ]
-    for k in keywords:
-        mask |= book.str.contains(k, na=False) | inst.str.contains(k, na=False)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="Alocação", index=False)
 
-    return mask
+        wb = writer.book
+        ws = writer.sheets["Alocação"]
+
+        # -----------------------------
+        # Gridlines OFF
+        # -----------------------------
+        ws.hide_gridlines(2)
+
+        # -----------------------------
+        # FORMATOS
+        # -----------------------------
+        fmt_header = wb.add_format({"bold": True})
+
+        fmt_money = wb.add_format({
+            "num_format": 'R$ #,##0.00',
+            "align": "right"
+        })
+
+        fmt_pct = wb.add_format({
+            "num_format": '0.00%',
+            "align": "right"
+        })
+
+        fmt_sec_text = wb.add_format({
+            "bold": True,
+            "bg_color": "#F3F4F6"
+        })
+
+        fmt_sec_money = wb.add_format({
+            "bold": True,
+            "bg_color": "#F3F4F6",
+            "num_format": 'R$ #,##0.00',
+            "align": "right"
+        })
+
+        fmt_sec_pct = wb.add_format({
+            "bold": True,
+            "bg_color": "#F3F4F6",
+            "num_format": '0.00%',
+            "align": "right"
+        })
+
+        fmt_total_text = wb.add_format({
+            "bold": True,
+            "bg_color": "#E5E7EB",
+            "top": 2
+        })
+
+        fmt_total_money = wb.add_format({
+            "bold": True,
+            "bg_color": "#E5E7EB",
+            "top": 2,
+            "num_format": 'R$ #,##0.00',
+            "align": "right"
+        })
+
+        fmt_total_pct = wb.add_format({
+            "bold": True,
+            "bg_color": "#E5E7EB",
+            "top": 2,
+            "num_format": '0.00%',
+            "align": "right"
+        })
+
+        # -----------------------------
+        # Cabeçalho
+        # -----------------------------
+        for col, name in enumerate(df.columns):
+            ws.write(0, col, name, fmt_header)
+
+        ws.set_column("A:A", 42)
+        ws.set_column("B:B", 18)
+        ws.set_column("C:C", 10)
+
+        ws.set_column("B:B", 18, fmt_money)
+        ws.set_column("C:C", 10, fmt_pct)
+
+        # -----------------------------
+        # Reescreve linhas de SEÇÃO / TOTAL
+        # -----------------------------
+        for i, kind in enumerate(row_kinds, start=1):
+            if kind == "section":
+                ws.write(i, 0, df.iloc[i-1, 0], fmt_sec_text)
+                ws.write(i, 1, df.iloc[i-1, 1], fmt_sec_money)
+                ws.write(i, 2, df.iloc[i-1, 2], fmt_sec_pct)
+
+            elif kind == "total":
+                ws.write(i, 0, df.iloc[i-1, 0], fmt_total_text)
+                ws.write(i, 1, df.iloc[i-1, 1], fmt_total_money)
+                ws.write(i, 2, df.iloc[i-1, 2], fmt_total_pct)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
 
 
 # ===== Configs =====
@@ -896,6 +991,15 @@ def tela_alocacao():
     with col_tbl:
         render_relatorio_excel_style(rows, "Tabela por Seções")
 
+    xls = gerar_excel_alocacao(rows)
+
+    st.download_button(
+        "Baixar tabela em Excel",
+        data=xls,
+        file_name=f"alocacao_{nome_carteira}_{data_base}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+)
 
 
 
