@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import re
 from datetime import date
 from typing import List, Dict, Any, Tuple
 
@@ -68,7 +69,6 @@ def _guide_cash_mask_message():
         "3) Recarregue a base e tente novamente."
     )
 
-import re
 
 def _parse_ptbr_currency(txt: str) -> float:
     """
@@ -93,6 +93,7 @@ def _fmt_ptbr_currency(v: float) -> str:
         return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "0,00"
+
 
 def _guess_cash_mask(df: pd.DataFrame) -> pd.Series:
     """
@@ -267,102 +268,142 @@ def _carregar_posicoes(data_base: date, carteira_id: str, headers: Dict[str, str
 
     return df, (overviews[0] if overviews else {})
 
+def _debug_top_exposures(df, label):
+    valcol = _pick_col(df, ["exposure_value", "last_exposure_value"])
+    if not valcol:
+        st.write(f"DEBUG | {label} sem exposure_value")
+        return
+    tmp = df.copy()
+    tmp[valcol] = pd.to_numeric(tmp[valcol], errors="coerce").fillna(0.0)
+    tmp["asset_value"] = pd.to_numeric(tmp.get("asset_value", 0), errors="coerce").fillna(0.0)
+
+    show = tmp.sort_values(valcol, key=lambda s: s.abs(), ascending=False).head(15)
+    st.write(f"DEBUG TOP EXPOSURES — {label}")
+    st.dataframe(show[["book_name","instrument_name","asset_value",valcol]].reset_index(drop=True))
+
 
 # ======================================================
 # ENGINE – REBALANCE + VALIDAÇÃO DE VENDA + CAIXA
 # ======================================================
 def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict]) -> pd.DataFrame:
+    """
+    REGRAS (CORRETAS):
+    - Altera SOMENTE asset_value (financeiro)
+    - Contrapartida SEMPRE no caixa
+    - exposure_value:
+        * só é ajustado para ativos "normais" (exposure ~ asset)
+        * NUNCA é ajustado para futuros / hedge (asset ~ 0, exposure grande)
+        * NUNCA é ajustado para caixa
+    """
+
     if df_base is None or df_base.empty:
         raise ValueError("Base vazia. Carregue a carteira antes de simular.")
 
     df = df_base.copy()
+
+    # normaliza chaves
     df["_iname"] = df["instrument_name"].astype(str).str.strip()
     df["_bname"] = df["book_name"].astype(str).str.strip()
 
+    # coluna de exposure
     value_col = _pick_col(df, ["exposure_value", "last_exposure_value"])
     if value_col is None:
-        raise ValueError("A base não contém exposure_value / last_exposure_value. Sem isso não dá para simular métricas.")
+        raise ValueError(
+            "A base não contém exposure_value / last_exposure_value. "
+            "Sem isso não dá para recalcular métricas oficiais."
+        )
 
+    # garante numérico
     df["asset_value"] = pd.to_numeric(df.get("asset_value", 0), errors="coerce").fillna(0.0)
     df[value_col] = pd.to_numeric(df.get(value_col, 0), errors="coerce").fillna(0.0)
 
+    # identifica caixa (pega o MAIOR, não o primeiro)
     cash_mask = _guess_cash_mask(df)
     if not cash_mask.any():
         raise RuntimeError("CASH_NOT_FOUND")
 
-    # vamos atualizar UMA linha de caixa (a primeira); o total de caixa é a soma do mask
-    cash_idx = df.index[cash_mask][0]
+    cash_candidates = df.loc[cash_mask].copy()
+    cash_candidates["asset_value"] = pd.to_numeric(cash_candidates["asset_value"], errors="coerce").fillna(0.0)
+    cash_idx = cash_candidates["asset_value"].abs().idxmax()
+
     eps = 1e-6
 
-    # ============================
-    # FIX: vendas primeiro, compras depois
-    # ============================
+    # limpa e ordena movimentos (vendas primeiro)
     movs = []
     for mv in movimentos:
         nome = str(mv.get("instrument_name") or "").strip()
         classe = str(mv.get("book_name") or "").strip()
         delta = float(mv.get("delta") or 0.0)
+
         if not nome or not classe:
-            raise ValueError("Movimento inválido: faltou Ativo (instrument_name) ou Classe (book_name).")
-        if abs(delta) < 1e-9:
+            raise ValueError("Movimento inválido: faltou instrument_name ou book_name.")
+
+        if abs(delta) < eps:
             continue
+
         movs.append({"instrument_name": nome, "book_name": classe, "delta": delta})
 
-    movs.sort(key=lambda x: 0 if x["delta"] < 0 else 1)  # vendas (neg) antes
+    movs.sort(key=lambda x: 0 if x["delta"] < 0 else 1)
 
+    # aplica movimentos
     for mv in movs:
         nome = mv["instrument_name"]
         classe = mv["book_name"]
         delta = mv["delta"]
 
         filtro = (df["_iname"] == nome) & (df["_bname"] == classe)
-        exists = bool(filtro.any())
 
-        # --------- VENDA: não pode exceder posição atual ----------
+        # trava ambiguidade (OBRIGATÓRIO)
+        if filtro.sum() != 1:
+            raise ValueError(
+                f"Movimento ambíguo: '{nome}' em '{classe}' bateu em {int(filtro.sum())} linhas."
+            )
+
+        # VENDA: trava por posição
         if delta < 0:
-            if not exists:
-                raise ValueError(f"Venda inválida: o ativo '{nome}' não existe na classe '{classe}'.")
             pos_atual = float(df.loc[filtro, "asset_value"].sum())
             if abs(delta) - pos_atual > eps:
                 raise ValueError(
                     f"Venda inválida: tentou vender R$ {_format_ptbr_num(abs(delta))}, "
-                    f"mas a posição atual é R$ {_format_ptbr_num(pos_atual)}.\n"
-                    f"Como resolver: reduza a venda para ≤ R$ {_format_ptbr_num(pos_atual)}."
+                    f"mas a posição atual é R$ {_format_ptbr_num(pos_atual)}."
                 )
 
-        # --------- COMPRA: checa caixa disponível (já com vendas aplicadas antes) ----------
+        # COMPRA: trava por caixa disponível
         if delta > 0:
-            caixa_disp = float(pd.to_numeric(df.loc[cash_mask, "asset_value"], errors="coerce").fillna(0.0).sum())
+            caixa_disp = float(df.loc[cash_mask, "asset_value"].sum())
             if delta - caixa_disp > eps:
                 raise ValueError(
-                    f"Compra inválida: caixa insuficiente.\n"
-                    f"Compra solicitada: R$ {_format_ptbr_num(delta)} | Caixa disponível: R$ {_format_ptbr_num(caixa_disp)}.\n"
-                    f"Como resolver: reduza a compra para ≤ R$ {_format_ptbr_num(caixa_disp)} "
-                    f"ou aumente o caixa (ou venda antes)."
+                    f"Compra inválida: caixa insuficiente. "
+                    f"Solicitado: R$ {_format_ptbr_num(delta)} | "
+                    f"Disponível: R$ {_format_ptbr_num(caixa_disp)}."
                 )
 
-        # aplica no ativo
-        if exists:
-            df.loc[filtro, "asset_value"] = df.loc[filtro, "asset_value"] + delta
-            # NÃO ajustar exposure_value aqui
+        # ===== APLICA FINANCEIRO =====
+        df.loc[filtro, "asset_value"] += delta
+        df.at[cash_idx, "asset_value"] -= delta
 
-        else:
-            raise ValueError(
-                "Ativo não encontrado para aplicar movimento.\n"
-                f"instrument_name='{nome}' | book_name='{classe}'.\n"
-                "Isso indica mismatch de texto (espaços invisíveis / duplicidade no DF)."
-            )
+        # ===== EXPOSURE: SÓ SE FOR ATIVO NORMAL =====
+        av = float(df.loc[filtro, "asset_value"].sum())
+        ex = float(df.loc[filtro, value_col].sum())
 
-        # contrapartida no caixa: cash = cash - delta
-        df.at[cash_idx, "asset_value"] = float(df.at[cash_idx, "asset_value"]) - delta
-        # NÃO ajustar exposure_value do caixa
+        # derivativo típico: asset ~ 0 e exposure grande
+        is_deriv_like = (abs(av) < eps and abs(ex) > eps)
+
+        if not is_deriv_like:
+            df.loc[filtro, value_col] += delta
+        # caixa e derivativos NÃO são mexidos
+
+    # NÃO remova derivativos: asset_value pode ser 0, mas exposure é relevante
+    exp_col = _pick_col(df, ["exposure_value", "last_exposure_value"])
+    if exp_col:
+        df = df[(df["asset_value"].abs() > 1e-6) | (df[exp_col].abs() > 1e-6)].reset_index(drop=True)
+    else:
+        df = df[df["asset_value"].abs() > 1e-6].reset_index(drop=True)
 
 
-    # limpa linhas quase zeradas
-    df["asset_value"] = pd.to_numeric(df["asset_value"], errors="coerce").fillna(0.0)
-    df = df[df["asset_value"].abs() > 1e-6].reset_index(drop=True)
-    # limpa colunas auxiliares
+    # limpa auxiliares
     df = df.drop(columns=[c for c in ["_iname", "_bname"] if c in df.columns], errors="ignore")
+
     return _recalc_pct_asset_value(df)
 
 
@@ -453,35 +494,139 @@ def _init_state():
 # UI: MÉTRICAS COMPARATIVAS (resumo)
 # ======================================================
 def _render_metricas_resumo(m_before: dict, m_after: dict):
-    st.markdown('<div class="card" style="margin-top:10px;">', unsafe_allow_html=True)
-    st.markdown("#### Métricas — antes vs depois")
+   
 
-    c1, c2, c3, c4 = st.columns(4)
+    def g(m, k):
+        if k not in m:
+            raise KeyError(f"Métrica ausente: '{k}'")
+        return float(m[k])
 
-    a = float(m_before.get("Enquadramento RV (%)", 0) or 0)
-    b = float(m_after.get("Enquadramento RV (%)", 0) or 0)
-    c1.metric("Nível RV (oficial)", f"{b:.2f}%", delta=f"{(b-a):+.2f} p.p.")
+    def fmt_brl(v):
+        return f"{v:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    a = float(m_before.get("Exp. Líquida RV Brasil %", 0) or 0)
-    b = float(m_after.get("Exp. Líquida RV Brasil %", 0) or 0)
-    c2.metric("Exp. Líq. RV BR (%)", f"{b:.2f}%", delta=f"{(b-a):+.2f} p.p.")
+    def delta_brl(a, b):
+        return f"Δ R$ {fmt_brl(b - a)}"
 
-    a = float(m_before.get("Exp. Líquida RV Global %", 0) or 0)
-    b = float(m_after.get("Exp. Líquida RV Global %", 0) or 0)
-    c3.metric("Exp. Líq. RV GL (%)", f"{b:.2f}%", delta=f"{(b-a):+.2f} p.p.")
+    def delta_pp(a, b):
+        return f"{(b - a):+.2f} p.p."
 
-    a = float(m_before.get("Net Dólar %", 0) or 0)
-    b = float(m_after.get("Net Dólar %", 0) or 0)
-    c4.metric("Net Dólar (%)", f"{b:.2f}%", delta=f"{(b-a):+.2f} p.p.")
+    # ================= LINHA 1 =================
+    c1, c2, c3 = st.columns(3)
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    with c1:
+        pl_a, pl_b = g(m_before, "PL"), g(m_after, "PL")
+        rv_a, rv_b = g(m_before, "Enquadramento RV (%)"), g(m_after, "Enquadramento RV (%)")
 
+        st.metric(
+            "PL",
+            f"R$ {fmt_brl(pl_b)}",
+            delta=delta_brl(pl_a, pl_b),
+        )
+        st.metric(
+            "Enquadramento RV",
+            f"{rv_b:.1f}%",
+            delta=delta_pp(rv_a, rv_b),
+        )
+
+    with c2:
+        a, b = g(m_before, "Exp. Bruta RV Brasil"), g(m_after, "Exp. Bruta RV Brasil")
+        ap, bp = g(m_before, "Exp. Bruta RV Brasil %"), g(m_after, "Exp. Bruta RV Brasil %")
+
+        h_a, h_b = g(m_before, "HEDGE ÍNDICE BR"), g(m_after, "HEDGE ÍNDICE BR")
+        hp_a, hp_b = g(m_before, "HEDGE ÍNDICE BR %"), g(m_after, "HEDGE ÍNDICE BR %")
+
+        l_a, l_b = g(m_before, "Exp. Líquida RV Brasil"), g(m_after, "Exp. Líquida RV Brasil")
+        lp_a, lp_b = g(m_before, "Exp. Líquida RV Brasil %"), g(m_after, "Exp. Líquida RV Brasil %")
+
+        st.metric(
+            "Exp. Bruta RV Brasil",
+            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
+            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
+        )
+        st.metric(
+            "HEDGE ÍNDICE BR",
+            f"R$ {fmt_brl(h_b)} ({hp_b:.1f}%)",
+            delta=f"{delta_brl(h_a, h_b)} | {delta_pp(hp_a, hp_b)}",
+        )
+        st.metric(
+            "Exp. Líquida RV Brasil",
+            f"R$ {fmt_brl(l_b)} ({lp_b:.1f}%)",
+            delta=f"{delta_brl(l_a, l_b)} | {delta_pp(lp_a, lp_b)}",
+        )
+
+    with c3:
+        a, b = g(m_before, "Exp. Bruta RV Global"), g(m_after, "Exp. Bruta RV Global")
+        ap, bp = g(m_before, "Exp. Bruta RV Global %"), g(m_after, "Exp. Bruta RV Global %")
+
+        h_a, h_b = g(m_before, "HEDGE ÍNDICE Global"), g(m_after, "HEDGE ÍNDICE Global")
+        hp_a, hp_b = g(m_before, "HEDGE ÍNDICE Global %"), g(m_after, "HEDGE ÍNDICE Global %")
+
+        l_a, l_b = g(m_before, "Exp. Líquida RV Global"), g(m_after, "Exp. Líquida RV Global")
+        lp_a, lp_b = g(m_before, "Exp. Líquida RV Global %"), g(m_after, "Exp. Líquida RV Global %")
+
+        st.metric(
+            "Exp. Bruta RV Global",
+            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
+            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
+        )
+        st.metric(
+            "HEDGE ÍNDICE Global",
+            f"R$ {fmt_brl(h_b)} ({hp_b:.1f}%)",
+            delta=f"{delta_brl(h_a, h_b)} | {delta_pp(hp_a, hp_b)}",
+        )
+        st.metric(
+            "Exp. Líquida RV Global",
+            f"R$ {fmt_brl(l_b)} ({lp_b:.1f}%)",
+            delta=f"{delta_brl(l_a, l_b)} | {delta_pp(lp_a, lp_b)}",
+        )
+
+    st.markdown("---")
+
+    # ================= LINHA 2 =================
+    c4, c5 = st.columns(2)
+
+    with c4:
+        a, b = g(m_before, "HEDGE DOL"), g(m_after, "HEDGE DOL")
+        ap, bp = g(m_before, "HEDGE DOL %"), g(m_after, "HEDGE DOL %")
+
+        st.metric(
+            "HEDGE Dólar",
+            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
+            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
+        )
+
+    with c5:
+        a, b = g(m_before, "Net Dólar"), g(m_after, "Net Dólar")
+        ap, bp = g(m_before, "Net Dólar %"), g(m_after, "Net Dólar %")
+
+        st.metric(
+            "Net Dólar",
+            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
+            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
+        )
+
+
+
+def _df_sem_caixa(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    book_l = df.get("book_name", "").astype(str).str.lower()
+    inst_l = df.get("instrument_name", "").astype(str).str.lower()
+
+    is_cash = (
+        book_l.str.contains("caixa", na=False) |
+        book_l.str.contains("cash", na=False) |
+        inst_l.str.contains("caixa", na=False) |
+        inst_l.str.contains("cash", na=False) |
+        inst_l.str.contains("saldo", na=False) |
+        inst_l.str.contains("conta corrente", na=False)
+    )
+    return df.loc[~is_cash].copy()
 
 # ======================================================
 # PAGE
 # ======================================================
 def tela_simulacao() -> None:
-    st.markdown("### Simulação de Carteira — posição atual + gráficos antes/depois")
+    st.markdown("### Simulação de Carteira")
     st.caption("Compra > 0 | Venda < 0. Venda travada pela posição atual. Compra travada por caixa disponível e vendas alimentam compras (ordem correta).")
 
     if "headers" not in st.session_state or not st.session_state.headers:
@@ -530,7 +675,7 @@ def tela_simulacao() -> None:
     ativos_unicos = sorted(df_antes["instrument_name"].dropna().unique().tolist())
     value_col = _pick_col(df_antes, ["exposure_value", "last_exposure_value"])
 
-    # --------- callbacks (garantem update do delta e rerun) ----------
+    # --------- callbacks ----------
     def _ensure_row(nome: str):
         if nome not in st.session_state.sim_exist_rows:
             classes_ativo = df_antes.loc[df_antes["instrument_name"] == nome, "book_name"].dropna().unique().tolist()
@@ -538,10 +683,6 @@ def tela_simulacao() -> None:
             st.session_state.sim_exist_rows[nome] = {"classe": default_class, "delta": 0.0}
 
     def _on_change_delta(nome: str, pos_atual: float):
-        """
-        Lê o texto do input, converte, aplica clamp de venda, salva no state.
-        Isso faz as métricas recalcularem no mesmo rerun (Streamlit).
-        """
         _ensure_row(nome)
 
         key_txt = f"sim_delta_txt_{nome}"
@@ -552,20 +693,15 @@ def tela_simulacao() -> None:
         if delta < 0 and abs(delta) > pos_atual:
             delta = -float(pos_atual)
 
-        # salva valor numérico (é ISSO que a simulação usa)
         st.session_state.sim_exist_rows[nome]["delta"] = float(delta)
-
-        # re-formata o texto no input (milhar/decimal PT-BR)
         st.session_state[key_txt] = _fmt_ptbr_currency(float(delta))
 
-    # Layout topo em 2 colunas
     colL, colR = st.columns([1.15, 1])
 
     # ================= CONTROLES =================
     with colL:
         st.markdown('<div class="card">', unsafe_allow_html=True)
 
-        # Caixa disponível (base) — informativo
         try:
             caixa_disp_base = _get_cash_available(df_antes)
             st.caption(f"Caixa disponível (base): R$ {_format_ptbr_num(caixa_disp_base)}")
@@ -582,20 +718,16 @@ def tela_simulacao() -> None:
         )
         st.markdown('<div class="help">Selecione ativos e defina ΔR$ (venda = negativo). Venda ≤ posição atual. Compra ≤ caixa disponível.</div>', unsafe_allow_html=True)
 
-        # remove os que saíram
         for nome in list(st.session_state.sim_exist_rows.keys()):
             if nome not in sel:
                 del st.session_state.sim_exist_rows[nome]
-                # limpa também o input textual (evita lixo no state)
                 k = f"sim_delta_txt_{nome}"
                 if k in st.session_state:
                     del st.session_state[k]
 
-        # cria entradas
         for nome in sel:
             _ensure_row(nome)
 
-        # linhas
         for nome in sel:
             dado = st.session_state.sim_exist_rows[nome]
             classes_ativo = df_antes.loc[df_antes["instrument_name"] == nome, "book_name"].dropna().unique().tolist()
@@ -623,12 +755,10 @@ def tela_simulacao() -> None:
                     st.caption(f"Posição atual: R$ {_format_ptbr_num(pos_atual)}")
 
             with cB:
-                # valor inicial do input (se não existir ainda)
                 key_txt = f"sim_delta_txt_{nome}"
                 if key_txt not in st.session_state:
                     st.session_state[key_txt] = _fmt_ptbr_currency(float(dado.get("delta", 0.0)))
 
-                # INPUT COM MILHAR: on_change garante que o delta numérico atualize e que dispare rerun
                 st.text_input(
                     "Δ R$",
                     key=key_txt,
@@ -636,26 +766,23 @@ def tela_simulacao() -> None:
                     args=(nome, pos_atual),
                 )
 
-                # exibe venda máx
                 st.caption(f"Venda máx.: R$ {_format_ptbr_num(pos_atual)}")
 
             st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
         st.markdown('<div class="small">', unsafe_allow_html=True)
-        st.write("Se aparecer erro de Caixa, ajuste `_guess_cash_mask()` com o nome real do seu caixa.")
-        st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # movimentos (sempre do STATE, nunca de variáveis locais)
+        st.markdown('</div>', unsafe_allow_html=True)
+
     movimentos = [
         {"instrument_name": nome, "book_name": info["classe"], "delta": float(info.get("delta", 0.0))}
         for nome, info in st.session_state.sim_exist_rows.items()
         if abs(float(info.get("delta", 0.0))) > 1e-6
     ]
 
-    # variáveis para full width
     df_depois = None
     m_before = None
     m_after = None
@@ -666,16 +793,13 @@ def tela_simulacao() -> None:
     with colR:
         try:
             df_depois = _aplicar_movimentos_rebalance(df_antes, movimentos) if movimentos else df_antes.copy()
-                    # DEBUG: prova que o DF está mudando de verdade
-            st.write("DEBUG | sum(asset_value) antes:", float(df_antes["asset_value"].sum()))
-            st.write("DEBUG | sum(asset_value) depois:", float(df_depois["asset_value"].sum()))
 
-            if value_col:
-                st.write("DEBUG | sum(exposure) antes:", float(pd.to_numeric(df_antes[value_col], errors="coerce").fillna(0.0).sum()))
-                st.write("DEBUG | sum(exposure) depois:", float(pd.to_numeric(df_depois[value_col], errors="coerce").fillna(0.0).sum()))
 
-        except RuntimeError as re:
-            if str(re) == "CASH_NOT_FOUND":
+
+
+
+        except RuntimeError as re_err:
+            if str(re_err) == "CASH_NOT_FOUND":
                 _guide_cash_mask_message()
                 return
             _user_error("Erro inesperado na simulação. Recarregue a base e tente novamente.")
@@ -683,30 +807,60 @@ def tela_simulacao() -> None:
         except ValueError as ve:
             _user_error(str(ve))
             return
-        except Exception:
-            _user_error("Falha ao aplicar movimentos. Recarregue a base e tente novamente.")
+        except Exception as e:
+            st.error(f"Falha ao aplicar movimentos: {type(e).__name__}: {e}")
+            st.exception(e)  # mostra stacktrace no Streamlit
             return
 
-        # Caixa líquido pós-simulação
+
         try:
             caixa_depois = _get_cash_available(df_depois)
             st.metric("Caixa (líquido) após simulação", f"R$ {_format_ptbr_num(caixa_depois)}")
         except Exception:
             pass
 
-        # métricas (calcula sempre)
+        # ======================================================
+        # MÉTRICAS — before/after com overview coerente
+        # ======================================================
         try:
-            m_before = _calcular_metricas_gestao(overview, df_antes)
-            m_after = _calcular_metricas_gestao(overview, df_depois)
+            overview_before = dict(overview or {})
+            overview_after = dict(overview or {})
+
+            pl_before = float(pd.to_numeric(df_antes.get("asset_value", 0), errors="coerce").fillna(0.0).sum())
+            pl_after  = float(pd.to_numeric(df_depois.get("asset_value", 0), errors="coerce").fillna(0.0).sum())
+            overview_before["net_asset_value"] = pl_before
+            overview_after["net_asset_value"]  = pl_after
+
+            if "instrument_type_id" in df_antes.columns:
+                it_bef = pd.to_numeric(df_antes["instrument_type_id"], errors="coerce").fillna(-1)
+                it_aft = pd.to_numeric(df_depois["instrument_type_id"], errors="coerce").fillna(-1)
+
+                eq_mask_bef = it_bef.isin([1, 2])  # 1=stock, 2=etf (ajuste se for diferente)
+                eq_mask_aft = it_aft.isin([1, 2])
+
+                eq_bef = float(pd.to_numeric(df_antes.loc[eq_mask_bef, "asset_value"], errors="coerce").fillna(0.0).sum())
+                eq_aft = float(pd.to_numeric(df_depois.loc[eq_mask_aft, "asset_value"], errors="coerce").fillna(0.0).sum())
+
+                overview_before["equity_exposure"] = eq_bef
+                overview_after["equity_exposure"]  = eq_aft
+
+            df_antes_m = _df_sem_caixa(df_antes)
+            df_depois_m = _df_sem_caixa(df_depois)
+
+            m_before = _calcular_metricas_gestao(overview_before, df_antes_m)
+            m_after  = _calcular_metricas_gestao(overview_after, df_depois_m)
+
+
+
             if m_before.get("_erro"):
                 raise ValueError(m_before["_erro"])
             if m_after.get("_erro"):
                 raise ValueError(m_after["_erro"])
+
         except Exception as e:
             _user_error(f"Falha ao recalcular métricas: {e}")
             return
 
-        # donuts
         agg_antes = _agg_por_classe(df_antes)
         agg_depois = _agg_por_classe(df_depois)
 
@@ -725,7 +879,7 @@ def tela_simulacao() -> None:
             st.plotly_chart(_fig_pizza(aggB, color_by=color_by), use_container_width=True, key="pizza_depois")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ======================= FULL WIDTH (embaixo) =======================
+    # ======================= FULL WIDTH =======================
     st.markdown("---")
     st.subheader("Métricas — antes vs depois")
     _render_metricas_resumo(m_before, m_after)
