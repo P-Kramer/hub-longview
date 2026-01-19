@@ -37,4 +37,4 @@ hedge_dol = "Moedas >> Futuros"
 
 caixa = ["USD", "BRL" , "TESOURO SELIC", "LFT"]
 
-
+derivativos = []

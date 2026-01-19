@@ -120,28 +120,107 @@ def _asof_on_or_before(series: pd.Series, ts: pd.Timestamp) -> Optional[pd.Times
         return series.index[idx]
     return None
 
+from datetime import date, timedelta
+import calendar
+from dateutil.relativedelta import relativedelta
 
-def _safe_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
+def nearest_business_day(d: date) -> date:
+    """
+    Dia útil mais próximo considerando apenas seg-sex.
+    - Sábado -> sexta (volta 1 dia)
+    - Domingo -> segunda (avança 1 dia)
+    """
+    wd = d.weekday()  # Mon=0 ... Sun=6
+    if wd == 5:       # Saturday
+        return d - timedelta(days=1)
+    if wd == 6:       # Sunday
+        return d + timedelta(days=1)
+    return d
+
+def _shift_months_keep_day_clamped(d: date, months_back: int) -> date:
+    """
+    Volta 'months_back' meses tentando manter o mesmo dia do mês.
+    Se o dia não existir no mês alvo (ex: 31/02), usa o último dia do mês.
+    """
+    target = d + relativedelta(months=-months_back)
+    y, m = target.year, target.month
+    last_day = calendar.monthrange(y, m)[1]
+    day = min(d.day, last_day)  # mantém o dia original quando possível
+    return date(y, m, day)
+
+def anchor_dates(d: date) -> dict:
+    """
+    Recebe uma data 'd' e devolve 4 datas ajustadas:
+    - 3 meses atrás
+    - 6 meses atrás
+    - 18 meses atrás
+    - 24 meses atrás
+    Regras:
+      1) volta meses mantendo o dia quando possível; se não existir, cai no último dia do mês
+      2) ajusta para o dia útil mais próximo (seg-sex)
+    """
+    raw = {
+        "3m":  _shift_months_keep_day_clamped(d, 3),
+        "6m":  _shift_months_keep_day_clamped(d, 6),
+        "18m": _shift_months_keep_day_clamped(d, 18),
+        "24m": _shift_months_keep_day_clamped(d, 24),
+    }
+    return {k: nearest_business_day(v) for k, v in raw.items()}
+def find_dates(d: date) -> List[str]:
+    anchors = anchor_dates(d)  # {"3m": date, "6m": date, ...}
+
+    return [
+        anchors["3m"].isoformat(),
+        anchors["6m"].isoformat(),
+        anchors["18m"].isoformat(),
+        anchors["24m"].isoformat(),
+    ]
 
 
 # --------------------------
 # API (posições)
 # --------------------------
 def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], headers: Dict[str, str]) -> pd.DataFrame:
+    custom_dates = find_dates(end_date)
     payload = {
-    "start_date": str(start_date),
-    "end_date": str(start_date),
-    "instrument_position_aggregation": 3,
-    "portfolio_ids": portfolio_ids,
-    "include_profitabilities": True,
-}
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "instrument_position_aggregation": 3,
+        "include_profitabilities": True,
+        "portfolio_ids": portfolio_ids
+    }
+    payload2 = {
+        "date": str(end_date),
+        "profitability_periods": [2,3,5,6,7],
+        "portfolio_ids": portfolio_ids,
+        "custom_dates": custom_dates
+    }
     
     try:
+        r = requests.post(
+            f"{BASE_URL_API}/portfolio_position/profitability/portfolio_profitability_view",
+            json=payload2,
+            headers=headers,
+            timeout=60
+        )
+        
+        r.raise_for_status()
+        resultado = r.json()
+        
+        prof = resultado.get("portfolios", {})
+
+        registros: List[dict] = []
+        for item in prof.values():
+            if isinstance(item, list):
+                registros.extend(item)
+            else:
+                registros.append(item)
+
+        df_valores = pd.json_normalize(registros)
+        df_valores = df_valores.filter(like="profitability_by_custom_date.")
+        vals = pd.to_numeric(df_valores.iloc[0], errors="coerce").tolist()
+        prof_3m, prof_6m, prof_18m, prof_24m = vals
+   
         r = requests.post(
             f"{BASE_URL_API}/portfolio_position/positions/get",
             json=payload,
@@ -152,7 +231,7 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
         r.raise_for_status()
         resultado = r.json()
         dados = resultado.get("objects", {})
-        print (dados)
+ 
         registros: List[dict] = []
         for item in dados.values():
             if isinstance(item, list):
@@ -214,12 +293,17 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
             "fixed_navps": "Cota Fixa",
             "financial_transaction_positions": "CPR",
         }, inplace=True)
-        st.dataframe(df)
+
+        df ["%3 Meses"] = prof_3m
+        df ["%6 Meses"] = prof_6m
+        df ["%18 Meses"] = prof_18m
+        df ["%24 Meses"] = prof_24m
+
         if "Data" in df.columns:
             df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
         if "Cota Líquida" in df.columns:
             df["Cota Líquida"] = pd.to_numeric(df["Cota Líquida"], errors="coerce")
-
+     
         percentage_cols = [col for col in df.columns if col.startswith("%") or col.startswith("Bench %")]
         for col in percentage_cols:
             df[col] = df[col].apply(_parse_percentage_value)
@@ -347,25 +431,6 @@ WINDOW_TO_BACKEND_COL = {
     "24m": "%24 Meses",
 }
 
-
-def _get_portfolio_returns_from_backend_df(df: pd.DataFrame, carteira: str, windows: List[str]) -> Dict[str, float]:
-    out = {w: np.nan for w in windows}
-    sub = df[df["Carteira"] == carteira].copy()
-    if sub.empty:
-        return out
-
-    # pega o último registro (mesma data, mas ok)
-    row = sub.sort_values("Data").iloc[-1] if "Data" in sub.columns else sub.iloc[-1]
-
-    for w in windows:
-        col = WINDOW_TO_BACKEND_COL.get(w)
-        if not col or col not in df.columns:
-            out[w] = np.nan
-            continue
-        v = row.get(col, np.nan)
-        out[w] = float(v) if pd.notna(v) else np.nan
-
-    return out
 
 
 # --------------------------
@@ -552,244 +617,6 @@ def _render_client_summary_multi(
 
 
 
-
-# --------------------------
-# Barras: retorno por janela (mantido)
-# --------------------------
-def _render_performance_bars(comparison_df: pd.DataFrame, windows: List[str]):
-    if comparison_df.empty or not windows:
-        return
-
-    chart_df = comparison_df.set_index("Nome")
-    fig = go.Figure()
-    colors = px.colors.qualitative.Set3
-
-    for i, w in enumerate(windows):
-        fig.add_trace(go.Bar(
-            name=w,
-            x=chart_df.index,
-            y=(chart_df[w] * 100.0),
-            text=chart_df[w].apply(lambda x: f"{x*100:.1f}%"),
-            textposition="auto",
-            marker_color=colors[i % len(colors)],
-        ))
-
-    fig.update_layout(
-        title="Barras: Retorno por Janelas Selecionadas",
-        xaxis_title="",
-        yaxis_title="Retorno (%)",
-        barmode="group",
-        height=520,
-        showlegend=True
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# --------------------------
-# Equity curves
-# --------------------------
-def _render_equity_curves(
-    df_perf: pd.DataFrame,
-    selected_carteiras: List[str],
-    benchmark_names: List[str],
-    main_window: str
-):
-    """Equity curve base 100 na janela escolhida. Benchmarks via backend prices/get."""
-    if df_perf.empty or not selected_carteiras:
-        return
-
-    max_dt = pd.to_datetime(df_perf["Data"], errors="coerce").dropna().max()
-    periods = _periods(max_dt if pd.notna(max_dt) else pd.Timestamp.now(), windows=[main_window])
-    if main_window not in periods:
-        return
-    start_ts, end_ts = periods[main_window]
-
-    st.markdown(f"### Equity Curve (base 100) — janela {main_window}")
-
-    fig = go.Figure()
-
-    for carteira in selected_carteiras:
-        sub = df_perf[df_perf["Carteira"] == carteira].copy()
-        if sub.empty:
-            continue
-        sub = sub[["Data", "Cota Líquida"]].dropna().sort_values("Data")
-        sub = sub[(sub["Data"] >= pd.Timestamp(start_ts)) & (sub["Data"] <= pd.Timestamp(end_ts))]
-        if sub.empty:
-            continue
-
-        s = sub.set_index("Data")["Cota Líquida"]
-        s = s[~s.index.duplicated(keep="last")].sort_index()
-        if s.empty:
-            continue
-
-        base = float(s.iloc[0])
-        if base == 0 or pd.isna(base):
-            continue
-
-        eq = (s / base) * 100.0
-        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=f"{carteira}"))
-
-    selected_ids = [BENCHMARK_NAME_TO_ID[n] for n in benchmark_names if n in BENCHMARK_NAME_TO_ID]
-    df_prices = _post_market_prices(
-        start_date=pd.Timestamp(start_ts).date(),
-        end_date=pd.Timestamp(end_ts).date(),
-        instrument_ids=selected_ids,
-        headers=st.session_state.headers,
-    )
-
-    for name in benchmark_names:
-        iid = BENCHMARK_NAME_TO_ID.get(name)
-        if iid is None:
-            continue
-
-        sub = df_prices[df_prices["InstrumentID"] == int(iid)].copy()
-        if sub.empty:
-            continue
-
-        sub = sub[["Data", "Preco"]].dropna().sort_values("Data")
-        s = sub.set_index("Data")["Preco"]
-        s = s[~s.index.duplicated(keep="last")].sort_index()
-        if s.empty:
-            continue
-
-        base = float(s.iloc[0])
-        if base == 0 or pd.isna(base):
-            continue
-
-        eq = (s / base) * 100.0
-        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=name))
-
-    fig.update_layout(height=520, xaxis_title="Data", yaxis_title="Base 100", legend_title="Séries")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# --------------------------
-# Detalhe por carteira (mantido)
-# --------------------------
-def _render_detailed_comparison(
-    df_perf: pd.DataFrame,
-    selected_carteiras: List[str],
-    selected_benchmarks: List[str],
-    selected_windows: List[str],
-):
-    if df_perf.empty or not selected_carteiras or not selected_benchmarks:
-        return
-
-    windows = [w for w in WINDOW_ORDER if w in set(selected_windows)]
-    if not windows:
-        return
-
-    st.markdown("### Detalhe por Carteira")
-
-    max_dt = pd.to_datetime(df_perf["Data"], errors="coerce").dropna().max()
-    periods = _periods(max_dt if pd.notna(max_dt) else pd.Timestamp.now(), windows=windows)
-    preferred = "12m" if "12m" in windows else windows[-1]
-
-    min_start = min([p[0] for p in periods.values()])
-    max_end = max([p[1] for p in periods.values()])
-    selected_ids = [BENCHMARK_NAME_TO_ID[n] for n in selected_benchmarks if n in BENCHMARK_NAME_TO_ID]
-    df_prices = _post_market_prices(
-        start_date=min_start.date(),
-        end_date=max_end.date(),
-        instrument_ids=selected_ids,
-        headers=st.session_state.headers,
-    )
-
-
-
-# --------------------------
-# Auditoria (mantida)
-# --------------------------
-def _create_backend_vs_calculated_df(
-    df_perf: pd.DataFrame,
-    selected_carteiras: List[str],
-    selected_windows: List[str],
-) -> pd.DataFrame:
-    if df_perf.empty or not selected_carteiras:
-        return pd.DataFrame()
-
-    windows = [w for w in WINDOW_ORDER if w in set(selected_windows)]
-    if not windows:
-        return pd.DataFrame()
-
-    mapping = {
-        "1d": "%Dia",
-        "1m": "%Mês",
-        "6m": "%6 Meses",
-        "12m": "%12 Meses",
-        "18m": "%18 Meses",
-        "24m": "%24 Meses",
-    }
-
-    max_dt_global = pd.to_datetime(df_perf["Data"], errors="coerce").dropna().max()
-    periods = _periods(max_dt_global if pd.notna(max_dt_global) else pd.Timestamp.now(), windows=windows)
-
-    rows = []
-    for carteira in selected_carteiras:
-        sub = df_perf[df_perf["Carteira"] == carteira].copy()
-        if sub.empty:
-            continue
-
-        sub["Data"] = pd.to_datetime(sub["Data"], errors="coerce")
-        sub = sub.dropna(subset=["Data"]).sort_values("Data")
-        if sub.empty:
-            continue
-
-        last = sub.iloc[-1]
-
-
-        row: Dict[str, Any] = {"Carteira": carteira, "Data": sub["Data"].max().date()}
-
-        for w in windows:
-            col = mapping.get(w)
-            if not col:
-                continue
-            backend_val = last.get(col, np.nan)
-            backend_val = float(backend_val) if pd.notna(backend_val) else np.nan
-
-
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def _render_backend_vs_calculated_pretty(df_perf: pd.DataFrame, selected_carteiras: List[str], selected_windows: List[str]):
-    st.markdown("### Auditoria: Calculado vs Backend")
-
-    cmp_df = _create_backend_vs_calculated_df(df_perf, selected_carteiras, selected_windows)
-    if cmp_df.empty:
-        st.info("Sem dados para comparar.")
-        return
-
-    show = cmp_df.copy()
-    diff_cols = [c for c in show.columns if c.endswith("diff(pp)")]
-    calc_cols = [c for c in show.columns if c.endswith(" calc")]
-    back_cols = [c for c in show.columns if c.endswith(" back")]
-
-    for c in calc_cols + back_cols:
-        show[c] = show[c].apply(lambda x: _fmt_pct(x) if pd.notna(x) else "")
-
-    def _diff_style(v):
-        try:
-            v = float(v)
-        except Exception:
-            return ""
-        if pd.isna(v):
-            return ""
-        if abs(v) >= 1.0:
-            return "background-color: #ffd6d6"
-        if abs(v) >= 0.25:
-            return "background-color: #fff3cd"
-        return ""
-
-    sty = show.style
-    for c in diff_cols:
-        sty = sty.format({c: (lambda x: _fmt_pp(x) if pd.notna(x) else "")})
-        sty = sty.applymap(_diff_style, subset=[c])
-
-    st.dataframe(sty, use_container_width=True)
-
-
 # --------------------------
 # Tela – Performance
 # --------------------------
@@ -800,34 +627,31 @@ def tela_performance() -> None:
     if "headers" not in st.session_state or not st.session_state.headers:
         st.warning("Faça login para consultar os dados.")
         return
-    df = st.session_state.get("df_perf", pd.DataFrame())
-    
+
     st.markdown("### Performance de Carteiras")
     st.divider()
 
+    # -----------------------------
+    # Filtros
+    # -----------------------------
     with st.container():
-        c_f1, c_f2, c_f3,  c_f5 = st.columns([1.2, 2.2, 1.4, 1.0])
+        c_f1, c_f2, c_f3, c_f4, c_f5 = st.columns([1.3, 2.2, 1.8, 1.9, 1.0])
 
         with c_f1:
-            st.markdown("**Janela de Consulta (dados brutos)**")
-            d_ref = st.date_input(
-            "",
-            value=date.today(),
-            key="perf_data_ref",
-            label_visibility="collapsed",
-        )
-        d_ini = d_ref
-        d_fim = d_ref
-
+            st.markdown("**Data**")
+            d_fim = st.date_input(
+                "",
+                value=date.today(),
+                key="perf_data_fim",
+                label_visibility="collapsed",
+            )
 
         with c_f2:
-            st.markdown("**Carteiras**")
-            carteiras_nomes = st.multiselect(
-                "",
+            carteira_nome = st.selectbox(
+                "**Carteira**",
                 sorted(CARTEIRAS.values()),
-                default=[],
-                key="perf_carteiras",
-                label_visibility="collapsed"
+                index=0,
+                key="perf_carteira_base",
             )
 
         with c_f3:
@@ -837,119 +661,107 @@ def tela_performance() -> None:
                 options=list(BENCHMARK_NAME_TO_ID.keys()),
                 default=["CDI", "IMAB"],
                 key="perf_bmarks",
-                label_visibility="collapsed"
+                label_visibility="collapsed",
             )
 
-
+        with c_f4:
+            st.markdown("**Janelas (retornos)**")
+            default_windows = ["1m", "3m", "6m", "12m", "18m", "24m"]
+            user_windows = st.multiselect(
+                "",
+                options=WINDOW_ORDER,
+                default=[w for w in default_windows if w in WINDOW_ORDER],
+                key="perf_user_windows",
+                label_visibility="collapsed",
+            )
 
         with c_f5:
             st.markdown(" ")
             carregar = st.button("Buscar", key="perf_btn_carregar", use_container_width=True)
 
-    carteiras_ids = [k for k, v in CARTEIRAS.items() if v in carteiras_nomes]
-    windows = st.session_state.get("selected_windows", ["1m","3m","6m","12m", "ano", "dia"])
-    windows = [w for w in WINDOW_ORDER if w in set(windows)]
-    # mapeamento janela -> coluna do df do backend
-    WINDOW_TO_BACKEND_COL = {
-        "1m": "%Mês",
-        "6m": "%6 Meses",
-        "12m": "%12 Meses",
-        "18m": "%18 Meses",
-        "24m": "%24 Meses",
-        "ano": "%Ano",
-        "dia": "%Dia"
-    }
+    # carteira id para backend
+    carteiras_ids = [k for k, v in CARTEIRAS.items() if v == carteira_nome]
+    if carteiras_ids:
+        carteira_id = [int(carteiras_ids[0])]
+    else:
+        carteira_id = []
 
-    # carteira base = primeira selecionada
-    carteira_base = st.session_state.get("selected_carteiras", [])
-    carteira_base = carteira_base[0] if carteira_base else None
-
-    windows_filtradas = []
-
-    if carteira_base:
-        sub = df[df.get("Carteira") == carteira_base] if "Carteira" in df.columns else pd.DataFrame()
-        if not sub.empty:
-            # pega a última linha (mais recente)
-            row = sub.sort_values("Data").iloc[-1] if "Data" in sub.columns else sub.iloc[-1]
-
-            for w in windows:
-                col = WINDOW_TO_BACKEND_COL.get(w)
-                if not col or col not in df.columns:
-                    continue
-
-                val = row.get(col, np.nan)
-
-                # >>> FILTRO: só entra se NÃO for NaN
-                if pd.notna(val):
-                    windows_filtradas.append(w)
-
-    windows = windows_filtradas
-
-
+    # -----------------------------
+    # Buscar snapshot (1 dia)
+    # -----------------------------
     if carregar:
-        if not carteiras_ids:
-            st.error("Selecione ao menos uma carteira.")
+        if not carteira_id:
+            st.error("Carteira inválida.")
             return
 
-
         try:
-            with st.spinner("Buscando dados das carteiras..."):
-                df = _post_positions(d_ini, d_fim, carteiras_ids, st.session_state.headers)
+            with st.spinner("Buscando dados (as-of)..."):
+                # snapshot: só a data final
+                df = _post_positions(d_fim, d_fim, carteira_id, st.session_state.headers)
 
             if df.empty:
-                st.info("Nenhum dado retornado para os filtros informados.")
+                st.info("Nenhum dado retornado para a data selecionada.")
                 return
 
             st.session_state.df_perf = df
-            st.session_state.selected_carteiras = carteiras_nomes
+            st.session_state.selected_carteiras = [carteira_nome]
             st.session_state.selected_benchmarks = bmarks
-            st.session_state.selected_windows = [w for w in WINDOW_ORDER if w in set(windows)]
+            st.session_state.selected_windows = [w for w in WINDOW_ORDER if w in set(user_windows)]
+
             st.success("Dados carregados com sucesso!")
 
         except Exception as e:
             st.error(f"Erro ao buscar dados: {e}")
             return
 
-    if "df_perf" not in st.session_state or st.session_state.df_perf.empty:
-        st.info("Selecione carteiras, benchmarks e janelas e clique em Buscar.")
+    # -----------------------------
+    # Validação pós-busca
+    # -----------------------------
+    if st.session_state.df_perf.empty:
+        st.info("Selecione carteira, benchmarks e janelas e clique em Buscar.")
         return
-    print(df)
 
-    windows = ["1m", "3m", "6m", "12m"]
-    windows = [w for w in WINDOW_ORDER if w in set(windows)]
+    df = st.session_state.df_perf
+    selected_carteiras = st.session_state.get("selected_carteiras", [])
+    selected_benchmarks = st.session_state.get("selected_benchmarks", [])
+    windows = st.session_state.get("selected_windows", [])
 
+    if not selected_carteiras:
+        st.info("Selecione ao menos uma carteira e clique em Buscar.")
+        return
 
+    if not selected_benchmarks:
+        st.warning("Selecione ao menos 1 benchmark para comparar.")
+        return
+
+    if not windows:
+        st.error("Selecione ao menos uma janela.")
+        return
+
+    # -----------------------------
+    # Comparação (Carteira + Benchmarks)
+    # -----------------------------
     comparison_df = _create_comparison_dataframe(
-        df,
-        st.session_state.get("selected_carteiras", []),
-        st.session_state.get("selected_benchmarks", []),
-        windows
+        df_perf=df,
+        selected_carteiras=selected_carteiras,
+        selected_benchmarks=selected_benchmarks,
+        selected_windows=windows,
     )
 
     if comparison_df.empty:
         st.info("Sem dados para exibir.")
         return
 
-    main_window = windows[0]
+    # janela principal para ordenar (usa 12m se existir, senão a primeira)
+    sort_window = "12m" if "12m" in windows else windows[0]
 
-    tab1, tab2 = st.tabs(["Resumo", "Gráficos"])
-
-    with tab1:
-        _render_client_summary_multi(
-            comparison_df=comparison_df,
-            windows=windows,
-            sort_window=main_window,
-            selected_carteiras=st.session_state.get("selected_carteiras", []),
-            selected_benchmarks=st.session_state.get("selected_benchmarks", []),
-        )
-
-    with tab2:
-        _render_performance_bars(comparison_df, windows)
-        st.divider()
-        _render_equity_curves(
-            df_perf=df,
-            selected_carteiras=st.session_state.get("selected_carteiras", []),
-            benchmark_names=st.session_state.get("selected_benchmarks", []),
-            main_window=main_window
-        )
-
+    # -----------------------------
+    # Resumo (cards)
+    # -----------------------------
+    _render_client_summary_multi(
+        comparison_df=comparison_df,
+        windows=windows,
+        sort_window=sort_window,
+        selected_carteiras=selected_carteiras,
+        selected_benchmarks=selected_benchmarks,
+    )
