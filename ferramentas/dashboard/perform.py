@@ -30,15 +30,17 @@ BENCHMARK_NAME_TO_ID: Dict[str, int] = {v: k for k, v in BENCHMARKS.items()}
 # --------------------------
 # Janelas (ordem + labels)
 # --------------------------
-WINDOW_ORDER = ["1d", "1m", "3m", "6m", "12m", "18m", "24m"]
+WINDOW_ORDER = ["1d", "1m", "3m", "6m", "12m", "24m", "36m", "48m","60m"]
 WINDOW_LABELS = {
     "1d": "1 dia",
     "1m": "1 mês",
     "3m": "3 meses",
     "6m": "6 meses",
     "12m": "12 meses",
-    "18m": "18 meses",
     "24m": "24 meses",
+    "36m": "36 meses",
+    "48m": "48 meses",
+    "60m": "60 meses",
 }
 
 
@@ -54,13 +56,14 @@ def _periods(today: Optional[pd.Timestamp] = None, windows: Optional[List[str]] 
 
     base = {
         "1d":  (today - pd.Timedelta(days=1), today),
-        "1w":  (today - pd.Timedelta(weeks=1), today),
         "1m":  (today - pd.DateOffset(months=1), today),
         "3m":  (today - pd.DateOffset(months=3), today),
         "6m":  (today - pd.DateOffset(months=6), today),
         "12m": (today - pd.DateOffset(months=12), today),
-        "18m": (today - pd.DateOffset(months=18), today),
         "24m": (today - pd.DateOffset(months=24), today),
+        "36m": (today - pd.DateOffset(months=36), today),
+        "48m": (today - pd.DateOffset(months=48), today),
+        "60m": (today - pd.DateOffset(months=60), today),
     }
 
     if not windows:
@@ -162,8 +165,10 @@ def anchor_dates(d: date) -> dict:
 
         "3m":  _shift_months_keep_day_clamped(d, 3),
         "6m":  _shift_months_keep_day_clamped(d, 6),
-        "18m": _shift_months_keep_day_clamped(d, 18),
         "24m": _shift_months_keep_day_clamped(d, 24),
+        "36m": _shift_months_keep_day_clamped(d, 36),
+        "48m": _shift_months_keep_day_clamped(d, 48),
+        "60m": _shift_months_keep_day_clamped(d, 60),
     }
     return {k: nearest_business_day(v) for k, v in raw.items()}
 def find_dates(d: date) -> List[str]:
@@ -172,8 +177,10 @@ def find_dates(d: date) -> List[str]:
     return [
         anchors["3m"].isoformat(),
         anchors["6m"].isoformat(),
-        anchors["18m"].isoformat(),
         anchors["24m"].isoformat(),
+        anchors["36m"].isoformat(),
+        anchors["48m"].isoformat(),
+        anchors["60m"].isoformat(),
     ]
 
 def _has_window_coverage(cum: pd.DataFrame, end_ts: pd.Timestamp, window: str, min_coverage: float = 0.9) -> tuple[bool, str]:
@@ -263,7 +270,7 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
         df_valores = pd.json_normalize(registros)
         df_valores = df_valores.filter(like="profitability_by_custom_date.")
         vals = pd.to_numeric(df_valores.iloc[0], errors="coerce").tolist()
-        prof_3m, prof_6m, prof_18m, prof_24m = vals
+        prof_3m, prof_6m, prof_24m, prof_36m, prof_48m, prof_60m = vals
 
         payload3 = {
         "start_date": str(initial_date),
@@ -364,8 +371,10 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
 
         df ["%3 Meses"] = prof_3m
         df ["%6 Meses"] = prof_6m
-        df ["%18 Meses"] = prof_18m
         df ["%24 Meses"] = prof_24m
+        df ["%36 Meses"] = prof_36m
+        df ["%48 Meses"] = prof_48m
+        df ["%60 Meses"] = prof_60m
 
         if "Data" in df.columns:
             df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
@@ -495,8 +504,10 @@ WINDOW_TO_BACKEND_COL = {
     "3m":  "%3 Meses",     # se existir no df; se não existir, você não pode oferecer 3m
     "6m":  "%6 Meses",     # NÃO use %Semestre se você já tem %6 Meses
     "12m": "%12 Meses",    # use o específico, não %Ano
-    "18m": "%18 Meses",
     "24m": "%24 Meses",
+    "36m": "%36 Meses",
+    "48m": "%48 Meses",
+    "60m": "%60 Meses",
 }
 
 
@@ -823,8 +834,10 @@ WINDOW_TO_OFFSET = {
     "3m":  pd.DateOffset(months=3),
     "6m":  pd.DateOffset(months=6),
     "12m": pd.DateOffset(months=12),
-    "18m": pd.DateOffset(months=18),
     "24m": pd.DateOffset(months=24),
+    "36m": pd.DateOffset(months=36),
+    "48m": pd.DateOffset(months=48),
+    "60m": pd.DateOffset(months=60),
 }
 
 def _slice_and_rebase(cum: pd.DataFrame, end_ts: pd.Timestamp, window: str) -> pd.DataFrame:
@@ -871,7 +884,7 @@ def _render_client_summary_multi(
         st.warning("Selecione ao menos 1 benchmark para comparar.")
         return
 
-    # carteira “principal”
+    # carteira principal
     if len(selected_carteiras) == 1 and selected_carteiras[0] in df_c["Nome"].tolist():
         carteira_row = df_c[df_c["Nome"] == selected_carteiras[0]].head(1)
     else:
@@ -880,39 +893,78 @@ def _render_client_summary_multi(
     carteira_name = str(carteira_row["Nome"].iloc[0])
     st.markdown(f"### {carteira_name} vs Benchmarks")
 
-    c_val_main = float(carteira_row[sort_window].iloc[0]) if sort_window in carteira_row.columns and pd.notna(carteira_row[sort_window].iloc[0]) else np.nan
+    # filtra e ordena benchmarks conforme seleção do usuário
+    df_b = df_b[df_b["Nome"].isin(selected_benchmarks)].copy()
+    if df_b.empty:
+        st.warning("Selecione ao menos 1 benchmark para comparar.")
+        return
 
+    df_b["ord"] = df_b["Nome"].apply(lambda x: selected_benchmarks.index(x) if x in selected_benchmarks else 9999)
+    df_b = df_b.sort_values("ord").drop(columns=["ord"])
 
+    windows_ordered = [w for w in WINDOW_ORDER if w in set(windows)]
+    tabs = st.tabs([WINDOW_LABELS.get(w, w) for w in windows_ordered])
 
-    # UM BLOCO POR BENCHMARK
-    for bmk_name in selected_benchmarks:
-        bmk_row = df_b[df_b["Nome"] == bmk_name].head(1)
-        if bmk_row.empty:
-            continue
+    def fmt_pct(x):
+        return _fmt_pct(x) if pd.notna(x) else "-"
 
-        b_val_main = float(bmk_row[sort_window].iloc[0]) if sort_window in bmk_row.columns and pd.notna(bmk_row[sort_window].iloc[0]) else np.nan
-        ex_pp_main = (c_val_main - b_val_main) * 100.0 if pd.notna(c_val_main) and pd.notna(b_val_main) else np.nan
+    def fmt_pp(x):
+        return _fmt_pp(x) if pd.notna(x) else "-"
 
-        st.markdown(f"#### Vs {bmk_name}")
+    for i, w in enumerate(windows_ordered):
+        with tabs[i]:
+            c_val = float(carteira_row[w].iloc[0]) if w in carteira_row.columns and pd.notna(carteira_row[w].iloc[0]) else np.nan
 
-
-        # cards por janela (carteira + excesso vs esse benchmark)
-        blocks = [windows[i:i+3] for i in range(0, len(windows), 3)]
-        for blk in blocks:
-            cols = st.columns(len(blk))
-            for i, w in enumerate(blk):
-                c_val = float(carteira_row[w].iloc[0]) if w in carteira_row.columns and pd.notna(carteira_row[w].iloc[0]) else np.nan
-                b_val = float(bmk_row[w].iloc[0]) if w in bmk_row.columns and pd.notna(bmk_row[w].iloc[0]) else np.nan
+            # tabela numérica (para lógica)
+            rows = []
+            for _, bmk_row in df_b.iterrows():
+                bmk_name = str(bmk_row["Nome"])
+                b_val = float(bmk_row[w]) if w in bmk_row and pd.notna(bmk_row[w]) else np.nan
                 ex_pp = (c_val - b_val) * 100.0 if pd.notna(c_val) and pd.notna(b_val) else np.nan
 
-                cols[i].metric(
-                    label=f"{WINDOW_LABELS.get(w, w)}",
-                    value=_fmt_pct(c_val) if pd.notna(c_val) else "-",
-                    delta=_fmt_pp(ex_pp) if pd.notna(ex_pp) else "",
-                )
-                cols[i].caption(f"{bmk_name}: {_fmt_pct(b_val) if pd.notna(b_val) else '-'}")
+                rows.append({
+                    "Benchmark": bmk_name,
+                    "Carteira (%)": c_val,
+                    "Benchmark (%)": b_val,
+                    "Excesso (pp)": ex_pp,  # NUMÉRICO AQUI
+                })
 
-        st.divider()
+            t = pd.DataFrame(rows)
+
+            # tabela formatada (para exibir)
+            t_show = t.copy()
+            t_show["Carteira (%)"] = t_show["Carteira (%)"].apply(fmt_pct)
+            t_show["Benchmark (%)"] = t_show["Benchmark (%)"].apply(fmt_pct)
+            t_show["Excesso (pp)"] = t_show["Excesso (pp)"].apply(fmt_pp)
+
+            # estilo por linha usando os valores numéricos de t
+            def _style_row(row_idx: int):
+                v = t.loc[row_idx, "Excesso (pp)"]
+                if pd.isna(v):
+                    return [""] * t_show.shape[1]
+                if v > 0:
+                    color = "color: #1a7f37; font-weight: 700;"
+                elif v < 0:
+                    color = "color: #b42318; font-weight: 700;"
+                else:
+                    color = "color: #555555;"
+                styles = [""] * t_show.shape[1]
+                excesso_col = list(t_show.columns).index("Excesso (pp)")
+                styles[excesso_col] = color
+                return styles
+
+            styler = t_show.style.apply(lambda _row: _style_row(_row.name), axis=1)
+            styler = styler.set_properties(subset=["Benchmark"], **{"font-weight": "600"})
+
+            st.dataframe(
+                styler,
+                use_container_width=True,
+                hide_index=True,
+                key=f"tbl_client_{w}",
+            )
+
+            st.caption(f"Carteira no período: {fmt_pct(c_val)}")
+
 
 
 
