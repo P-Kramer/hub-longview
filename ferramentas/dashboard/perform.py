@@ -30,10 +30,9 @@ BENCHMARK_NAME_TO_ID: Dict[str, int] = {v: k for k, v in BENCHMARKS.items()}
 # --------------------------
 # Janelas (ordem + labels)
 # --------------------------
-WINDOW_ORDER = ["1d", "1w", "1m", "3m", "6m", "12m", "18m", "24m"]
+WINDOW_ORDER = ["1d", "1m", "3m", "6m", "12m", "18m", "24m"]
 WINDOW_LABELS = {
     "1d": "1 dia",
-    "1w": "1 semana",
     "1m": "1 mês",
     "3m": "3 meses",
     "6m": "6 meses",
@@ -160,6 +159,7 @@ def anchor_dates(d: date) -> dict:
       2) ajusta para o dia útil mais próximo (seg-sex)
     """
     raw = {
+
         "3m":  _shift_months_keep_day_clamped(d, 3),
         "6m":  _shift_months_keep_day_clamped(d, 6),
         "18m": _shift_months_keep_day_clamped(d, 18),
@@ -176,6 +176,42 @@ def find_dates(d: date) -> List[str]:
         anchors["24m"].isoformat(),
     ]
 
+def _has_window_coverage(cum: pd.DataFrame, end_ts: pd.Timestamp, window: str, min_coverage: float = 0.9) -> tuple[bool, str]:
+    """
+    Verifica se há dados suficientes para a janela.
+    min_coverage = 0.9 significa: precisa cobrir pelo menos 90% do período.
+    Retorna (ok, motivo).
+    """
+    if cum is None or cum.empty:
+        return False, "Sem série acumulada."
+
+    off = WINDOW_TO_OFFSET.get(window)
+    if off is None:
+        return False, "Janela não suportada."
+
+    end_ts = pd.Timestamp(end_ts)
+    start_ts = (end_ts - off).normalize()
+
+    sub = cum.loc[(cum.index >= start_ts) & (cum.index <= end_ts)]
+    if sub.empty:
+        return False, "Sem pontos no intervalo."
+
+    first = sub.index.min()
+    last = sub.index.max()
+
+    expected_days = max(1, (end_ts.normalize() - start_ts).days)
+    covered_days = max(0, (last.normalize() - first.normalize()).days)
+
+    coverage = covered_days / expected_days
+
+    if coverage < min_coverage:
+        return False, f"Dados insuficientes: cobre ~{coverage*100:.0f}% da janela (início disponível: {first.date()})."
+
+    # Também evita janelas “capengas” com poucos pontos
+    if len(sub) < 10:
+        return False, f"Poucos pontos ({len(sub)}) para esta janela."
+
+    return True, ""
 
 # --------------------------
 # API (posições)
@@ -193,9 +229,10 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
         "date": str(end_date),
         "profitability_periods": [2,3,5,6,7],
         "portfolio_ids": portfolio_ids,
-        "custom_dates": custom_dates
+        "custom_dates": custom_dates,
+        "use_initial_date_for_investment_reports": True
     }
-    
+
     try:
         r = requests.post(
             f"{BASE_URL_API}/portfolio_position/profitability/portfolio_profitability_view",
@@ -208,6 +245,7 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
         resultado = r.json()
         
         prof = resultado.get("portfolios", {})
+        
 
         registros: List[dict] = []
         for item in prof.values():
@@ -216,11 +254,41 @@ def _post_positions(start_date: date, end_date: date, portfolio_ids: List[str], 
             else:
                 registros.append(item)
 
+        df_reg = pd.DataFrame(registros)
+        # pegue o valor (primeira linha, coluna initial_date)
+        initial_date = df_reg.loc[0, "initial_date"]
+        st.session_state.perf_initial_date = str(initial_date)
+
+        
         df_valores = pd.json_normalize(registros)
         df_valores = df_valores.filter(like="profitability_by_custom_date.")
         vals = pd.to_numeric(df_valores.iloc[0], errors="coerce").tolist()
         prof_3m, prof_6m, prof_18m, prof_24m = vals
-   
+
+        payload3 = {
+        "start_date": str(initial_date),
+        "end_date": str(end_date),
+        "instrument_position_aggregation": 3,
+        "include_profitabilities": False,
+        "portfolio_ids": portfolio_ids,
+        }
+
+        r3 = requests.post(
+            f"{BASE_URL_API}/portfolio_position/positions/get",
+            json=payload3,
+            headers=headers,
+            timeout=60,
+        )
+        r3.raise_for_status()
+        j = r3.json()
+
+        data_graf = r3.json().get("objects", {})
+        
+
+        registros: List[dict] = []
+        for item in data_graf.values():
+            registros.extend(item if isinstance(item, list) else [item])
+        st.session_state.df_graf = pd.json_normalize(registros)
         r = requests.post(
             f"{BASE_URL_API}/portfolio_position/positions/get",
             json=payload,
@@ -432,6 +500,149 @@ WINDOW_TO_BACKEND_COL = {
 }
 
 
+def _explode_instrument_positions(df_graf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converte df_graf (positions/get normalizado) em um DF longo:
+    Data | Instrumento | Qty | MarketValue | UnitPrice
+    Tenta descobrir nomes de chaves comuns no dict de cada posição.
+    """
+    if df_graf is None or df_graf.empty:
+        return pd.DataFrame()
+
+    if "instrument_positions" not in df_graf.columns:
+        return pd.DataFrame()
+
+    df = df_graf.copy()
+    df["Data"] = pd.to_datetime(df.get("date"), errors="coerce")
+
+    rows = []
+    for _, r in df.iterrows():
+        dt = r.get("Data")
+        if pd.isna(dt):
+            continue
+
+        pos = r.get("instrument_positions")
+        if not isinstance(pos, list):
+            continue
+
+        for p in pos:
+            if not isinstance(p, dict):
+                continue
+
+            # Nome / ID (tentativas)
+            name = p.get("instrument_name") or p.get("name") or p.get("symbol") or p.get("ticker") or p.get("instrument")
+            iid = p.get("instrument_id") or p.get("id")
+
+            # Quantidade (tentativas)
+            qty = (
+                p.get("quantity")
+                or p.get("shares")
+                or p.get("position")
+                or p.get("qtd")
+            )
+
+            # Valor (tentativas)
+            mv = (
+                p.get("market_value")
+                or p.get("gross_market_value")
+                or p.get("asset_value")
+                or p.get("value")
+                or p.get("financial_value")
+            )
+
+            # Preço unitário (tentativas)
+            price = (
+                p.get("price")
+                or p.get("unit_price")
+                or p.get("last_price")
+                or p.get("market_price")
+            )
+
+            # Sanitiza
+            try:
+                qty_f = float(qty) if qty is not None else np.nan
+            except Exception:
+                qty_f = np.nan
+
+            try:
+                mv_f = float(mv) if mv is not None else np.nan
+            except Exception:
+                mv_f = np.nan
+
+            try:
+                price_f = float(price) if price is not None else np.nan
+            except Exception:
+                price_f = np.nan
+
+            # Se não veio preço, tenta inferir: market_value / qty
+            if (pd.isna(price_f) or price_f == 0.0) and pd.notna(mv_f) and pd.notna(qty_f) and qty_f != 0.0:
+                price_f = mv_f / qty_f
+
+            # Nome final
+            inst = str(name) if name is not None else (f"ID {iid}" if iid is not None else None)
+            if inst is None:
+                continue
+
+            rows.append({
+                "Data": dt,
+                "Instrumento": inst,
+                "InstrumentID": iid,
+                "Qty": qty_f,
+                "MarketValue": mv_f,
+                "UnitPrice": price_f,
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["UnitPrice"] = pd.to_numeric(out["UnitPrice"], errors="coerce")
+    out = out.dropna(subset=["Data", "Instrumento", "UnitPrice"]).sort_values(["Instrumento", "Data"])
+
+    # remove duplicatas por instrumento/dia
+    out = out.drop_duplicates(subset=["Instrumento", "Data"], keep="last")
+    return out
+
+def _instrument_price_pivot(df_long: pd.DataFrame) -> pd.DataFrame:
+    if df_long is None or df_long.empty:
+        return pd.DataFrame()
+    piv = df_long.pivot_table(index="Data", columns="Instrumento", values="UnitPrice", aggfunc="last").sort_index()
+    return piv.ffill()
+
+def _rank_best_worst(piv_price: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, n: int = 5, min_points: int = 5):
+    """
+    Retorno por ativo no período: last/first - 1 (as-of dentro do recorte).
+    Filtra ativos com poucos pontos.
+    """
+    if piv_price is None or piv_price.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    sub = piv_price.loc[(piv_price.index >= start_ts) & (piv_price.index <= end_ts)].copy()
+    if sub.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # remove colunas sem dados no recorte
+    sub = sub.dropna(axis=1, how="all")
+    if sub.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # filtra por quantidade mínima de pontos
+    counts = sub.notna().sum(axis=0)
+    keep = counts[counts >= min_points].index.tolist()
+    sub = sub[keep]
+    if sub.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    first = sub.apply(lambda s: s.dropna().iloc[0] if s.dropna().shape[0] else np.nan, axis=0)
+    last = sub.apply(lambda s: s.dropna().iloc[-1] if s.dropna().shape[0] else np.nan, axis=0)
+
+    ret = (last / first - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
+    if ret.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    top = ret.sort_values(ascending=False).head(n).to_frame("Retorno")
+    bot = ret.sort_values(ascending=True).head(n).to_frame("Retorno")
+    return top, bot
 
 # --------------------------
 # Rolling returns - Benchmarks (BACKEND)
@@ -479,6 +690,17 @@ def _compute_benchmark_rolling_returns(
 
     return out
 
+def _nav_from_df_graf(df_graf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converte df_graf (normalizado do positions/get) em série diária de cota.
+    Espera colunas: 'date' e 'navps'
+    """
+    df = df_graf.copy()
+    df["Data"] = pd.to_datetime(df.get("date"), errors="coerce")
+    df["Cota"] = pd.to_numeric(df.get("navps"), errors="coerce")
+
+    df = df.dropna(subset=["Data", "Cota"]).sort_values("Data").drop_duplicates(subset=["Data"], keep="last")
+    return df[["Data", "Cota"]]
 
 # --------------------------
 # Comparação (Carteiras + Benchmarks)
@@ -541,6 +763,83 @@ def _create_comparison_dataframe(
     for w in windows:
         out[w] = pd.to_numeric(out[w], errors="coerce")
     return out
+
+def _post_portfolio_nav_series(
+    df
+) -> pd.DataFrame:
+   
+
+    df["Data"] = pd.to_datetime(df.get("date"), errors="coerce")
+    df["Cota"] = pd.to_numeric(df.get("navps"), errors="coerce")  # cota líquida
+    df = df.dropna(subset=["Data", "Cota"]).sort_values("Data").drop_duplicates(subset=["Data"], keep="last")
+
+    return df[["Data", "Cota"]]
+
+def _bench_price_pivot(
+    start_date: date,
+    end_date: date,
+    benchmark_names: List[str],
+    headers: Dict[str, str],
+) -> pd.DataFrame:
+    ids = [BENCHMARK_NAME_TO_ID[n] for n in benchmark_names if n in BENCHMARK_NAME_TO_ID]
+    if not ids:
+        return pd.DataFrame()
+
+    df_prices = _post_market_prices(start_date, end_date, ids, headers)
+    if df_prices.empty:
+        return pd.DataFrame()
+
+    piv = (
+        df_prices.pivot_table(index="Data", columns="InstrumentID", values="Preco", aggfunc="last")
+        .sort_index()
+        .ffill()
+    )
+    piv = piv.rename(columns={BENCHMARK_NAME_TO_ID[n]: n for n in benchmark_names if n in BENCHMARK_NAME_TO_ID})
+    return piv
+
+def _series_to_daily_returns(port_nav: pd.DataFrame, bench_prices: pd.DataFrame) -> pd.DataFrame:
+    # carteira: cota -> retorno diário
+    s_port = port_nav.set_index("Data")["Cota"].sort_index()
+    ret_port = s_port.pct_change().fillna(0.0).rename("Carteira")
+
+    # benchmarks: preço -> retorno diário
+    ret_bench = bench_prices.pct_change().fillna(0.0) if bench_prices is not None and not bench_prices.empty else pd.DataFrame()
+
+    # junta por data
+    ret_all = pd.concat([ret_port, ret_bench], axis=1).sort_index()
+
+    # alinhamento: se algum índice faltar, assume 0 retorno naquele dia (não inventa preço)
+    ret_all = ret_all.fillna(0.0)
+
+    return ret_all
+
+
+def _daily_returns_to_cum(ret_all: pd.DataFrame) -> pd.DataFrame:
+    cum = (1.0 + ret_all).cumprod() - 1.0
+    return cum
+
+WINDOW_TO_OFFSET = {
+    "1m":  pd.DateOffset(months=1),
+    "3m":  pd.DateOffset(months=3),
+    "6m":  pd.DateOffset(months=6),
+    "12m": pd.DateOffset(months=12),
+    "18m": pd.DateOffset(months=18),
+    "24m": pd.DateOffset(months=24),
+}
+
+def _slice_and_rebase(cum: pd.DataFrame, end_ts: pd.Timestamp, window: str) -> pd.DataFrame:
+    if cum.empty:
+        return pd.DataFrame()
+    off = WINDOW_TO_OFFSET.get(window)
+    if off is None:
+        return pd.DataFrame()
+
+    start_ts = (pd.Timestamp(end_ts) - off).normalize()
+    sub = cum.loc[(cum.index >= start_ts) & (cum.index <= pd.Timestamp(end_ts))].copy()
+    if sub.empty:
+        return sub
+
+    return sub - sub.iloc[0]
 
 
 # ============================================================
@@ -695,7 +994,7 @@ def tela_performance() -> None:
             return
 
         try:
-            with st.spinner("Buscando dados (as-of)..."):
+            with st.spinner("Buscando dados (pode demorar um pouco)..."):
                 # snapshot: só a data final
                 df = _post_positions(d_fim, d_fim, carteira_id, st.session_state.headers)
 
@@ -737,31 +1036,157 @@ def tela_performance() -> None:
     if not windows:
         st.error("Selecione ao menos uma janela.")
         return
-
-    # -----------------------------
-    # Comparação (Carteira + Benchmarks)
-    # -----------------------------
-    comparison_df = _create_comparison_dataframe(
-        df_perf=df,
-        selected_carteiras=selected_carteiras,
-        selected_benchmarks=selected_benchmarks,
-        selected_windows=windows,
+    modo = st.radio(
+        "Exibição",
+        options=["Dados", "Gráficos"],
+        horizontal=True,
+        key="perf_view_mode",
     )
 
-    if comparison_df.empty:
-        st.info("Sem dados para exibir.")
-        return
+    if modo == "Dados":
+        # -----------------------------
+        # Comparação (Carteira + Benchmarks)
+        # -----------------------------
+        comparison_df = _create_comparison_dataframe(
+            df_perf=df,
+            selected_carteiras=selected_carteiras,
+            selected_benchmarks=selected_benchmarks,
+            selected_windows=windows,
+        )
 
-    # janela principal para ordenar (usa 12m se existir, senão a primeira)
-    sort_window = "12m" if "12m" in windows else windows[0]
+        if comparison_df.empty:
+            st.info("Sem dados para exibir.")
+            return
 
-    # -----------------------------
-    # Resumo (cards)
-    # -----------------------------
-    _render_client_summary_multi(
-        comparison_df=comparison_df,
-        windows=windows,
-        sort_window=sort_window,
-        selected_carteiras=selected_carteiras,
-        selected_benchmarks=selected_benchmarks,
-    )
+        sort_window = "12m" if "12m" in windows else windows[0]
+
+        # -----------------------------
+        # Resumo (cards)
+        # -----------------------------
+        _render_client_summary_multi(
+            comparison_df=comparison_df,
+            windows=windows,
+            sort_window=sort_window,
+            selected_carteiras=selected_carteiras,
+            selected_benchmarks=selected_benchmarks,
+        )
+    else:
+        initial_date = st.session_state.get("perf_initial_date")
+        if not initial_date:
+            st.info("Sem initial_date. Clique em Buscar novamente para carregar a data inicial da carteira.")
+            return
+
+        d_ini = pd.to_datetime(initial_date, errors="coerce").date()
+        if not d_ini:
+            st.error("initial_date inválida.")
+            return
+
+        d_fim = st.session_state.get("perf_data_fim", date.today())
+        end_ts = pd.Timestamp(d_fim)
+
+        # resolve portfolio_id (você já tem carteira_id acima)
+        if not carteira_id:
+            st.error("Carteira inválida.")
+            return
+        portfolio_id = int(carteira_id[0])
+
+        with st.spinner("Buscando séries diárias para gráficos..."):
+            df_graf = st.session_state.get("df_graf")
+            if df_graf is None or df_graf.empty:
+                st.info("Sem df_graf no session_state. Garanta que você carregou o histórico no botão Buscar.")
+                return
+
+            # série da carteira (navps)
+            port_nav = _nav_from_df_graf(df_graf)
+            if port_nav.empty:
+                st.error("Não consegui montar série de cota (navps) a partir do df_graf.")
+                return
+
+            # benchmarks (preços)
+            bench_prices = _bench_price_pivot(d_ini, d_fim, selected_benchmarks, st.session_state.headers)
+
+            # retornos diários + acumulado (carteira + benchmarks)
+            ret_all = _series_to_daily_returns(port_nav, bench_prices)
+            cum = _daily_returns_to_cum(ret_all)
+
+            # ---- ativos: explode + pivot de preço unitário (uma vez só)
+            df_long_inst = _explode_instrument_positions(df_graf)
+            piv_inst_price = _instrument_price_pivot(df_long_inst)
+
+        # janelas a plotar (respeita a ordem)
+        windows_plot = [w for w in WINDOW_ORDER if w in set(windows)]
+        if not windows_plot:
+            st.warning("Nenhuma janela selecionada para gráficos.")
+            return
+
+        tab_labels = [WINDOW_LABELS.get(w, w) for w in windows_plot]
+        tabs = st.tabs(tab_labels)
+
+        for i, w in enumerate(windows_plot):
+            with tabs[i]:
+                ok, reason = _has_window_coverage(cum, end_ts, w, min_coverage=0.9)
+                if not ok:
+                    st.info(f"Sem dados suficientes para {WINDOW_LABELS.get(w, w)}. {reason}")
+                    continue
+
+                sub = _slice_and_rebase(cum, end_ts, w)
+                if sub.empty:
+                    st.info(f"Sem dados para {WINDOW_LABELS.get(w, w)}.")
+                    continue
+
+                # ----------------
+                # Gráfico
+                # ----------------
+                df_plot = (sub * 100.0).reset_index()
+                xcol = df_plot.columns[0]
+                ycols = [c for c in df_plot.columns if c != xcol]
+
+                fig = px.line(df_plot, x=xcol, y=ycols)
+                fig.update_layout(yaxis_title="Retorno acumulado (%)", xaxis_title="")
+                st.plotly_chart(fig, use_container_width=True, key=f"graf_perf_{w}")
+
+                last = (sub.iloc[-1] * 100.0).round(2)
+                st.dataframe(last.to_frame("Retorno (%)"), key=f"tbl_perf_{w}")
+
+                # ----------------
+                # Top 5 / Bottom 5 ativos
+                # ----------------
+                st.divider()
+                st.markdown("#### Melhores e piores ativos no período")
+
+                off = WINDOW_TO_OFFSET.get(w)
+                start_ts = (pd.Timestamp(end_ts) - off).normalize() if off else sub.index.min()
+
+                if piv_inst_price is None or piv_inst_price.empty:
+                    st.info("Sem dados de ativos (instrument_positions) para montar ranking.")
+                    continue
+
+                top, bot = _rank_best_worst(
+                    piv_price=piv_inst_price,
+                    start_ts=start_ts,
+                    end_ts=pd.Timestamp(end_ts),
+                    n=5,
+                    min_points=5,
+                )
+
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    st.markdown("**Top 5**")
+                    if top.empty:
+                        st.info("Sem dados suficientes para ranking no período.")
+                    else:
+                        top_show = top.copy()
+                        top_show["Retorno (%)"] = (top_show["Retorno"] * 100.0).round(2)
+                        top_show = top_show.drop(columns=["Retorno"])
+                        st.dataframe(top_show, use_container_width=True, key=f"top5_{w}")
+
+                with c2:
+                    st.markdown("**Bottom 5**")
+                    if bot.empty:
+                        st.info("Sem dados suficientes para ranking no período.")
+                    else:
+                        bot_show = bot.copy()
+                        bot_show["Retorno (%)"] = (bot_show["Retorno"] * 100.0).round(2)
+                        bot_show = bot_show.drop(columns=["Retorno"])
+                        st.dataframe(bot_show, use_container_width=True, key=f"bot5_{w}")
