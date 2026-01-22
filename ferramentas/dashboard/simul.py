@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Tuple
 import requests
 import streamlit as st
 import pandas as pd
-
+import numpy as np
 from utils import BASE_URL_API, CARTEIRAS
 from .metricas_dash import caixa as caixa_ativos
 from .aloc import _calcular_metricas_gestao
@@ -424,15 +424,16 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
 # ======================================================
 # AGG / EXCEL
 # ======================================================
-def _agg_por_classe(df: pd.DataFrame) -> pd.DataFrame:
+def _agg_por_classe(df: pd.DataFrame, include_cash: bool = True) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["book_name", "asset_value", "pct"])
 
     tmp = df.copy()
     tmp["asset_value"] = pd.to_numeric(tmp.get("asset_value", 0), errors="coerce").fillna(0.0)
 
-    cash_mask = _guess_cash_mask(tmp, caixa_ativos)
-    tmp = tmp.loc[~cash_mask].copy()
+    if not include_cash:
+        cash_mask = _guess_cash_mask(tmp, caixa_ativos)
+        tmp = tmp.loc[~cash_mask].copy()
 
     tmp["asset_value_abs"] = tmp["asset_value"].abs()
     agg = tmp.groupby("book_name", as_index=False)["asset_value_abs"].sum()
@@ -441,6 +442,7 @@ def _agg_por_classe(df: pd.DataFrame) -> pd.DataFrame:
     total = float(agg["asset_value"].sum())
     agg["pct"] = (agg["asset_value"] / total) if total else 0.0
     return agg.sort_values("asset_value", ascending=False).reset_index(drop=True)
+
 
 
 
@@ -620,6 +622,75 @@ def _df_sem_caixa(df: pd.DataFrame) -> pd.DataFrame:
     cash_mask = _guess_cash_mask(df, caixa_ativos)
     return df.loc[~cash_mask].copy()
 
+def _book_name_caixa_preferido(df: pd.DataFrame) -> str:
+    """Escolhe um book_name de caixa existente (o maior) para manter consistência."""
+    cash_mask = _guess_cash_mask(df, caixa_ativos)
+    if not cash_mask.any():
+        return "Caixa"
+    tmp = df.loc[cash_mask].copy()
+    tmp["asset_value"] = pd.to_numeric(tmp.get("asset_value", 0), errors="coerce").fillna(0.0)
+    row = tmp.iloc[tmp["asset_value"].abs().values.argmax()]
+    return str(row.get("book_name") or "Caixa")
+
+def _aplicar_deposito_saque(df: pd.DataFrame, deposito: float, saque: float) -> pd.DataFrame:
+    """
+    Depósito: cria ativo novo 'Depósito' em classe Caixa (não mexe nos outros).
+    Saque: reduz caixa existente (maior linha de caixa).
+    Reusa _guess_cash_mask e _get_cash_available.
+    """
+    df = df.copy()
+    df["asset_value"] = pd.to_numeric(df.get("asset_value", 0), errors="coerce").fillna(0.0)
+
+    eps = 1e-6
+    deposito = float(deposito or 0.0)
+    saque = float(saque or 0.0)
+
+    if deposito < -eps or saque < -eps:
+        raise ValueError("Depósito e Saque devem ser valores positivos (o sinal é dado pelo campo).")
+
+    # --- SAQUE (valida e debita do caixa) ---
+    if saque > eps:
+        caixa_disp = _get_cash_available(df)  # REUSA
+        if saque - caixa_disp > eps:
+            raise ValueError(
+                f"Saque inválido: caixa insuficiente. "
+                f"Solicitado: R$ {_format_ptbr_num(saque)} | Disponível: R$ {_format_ptbr_num(caixa_disp)}."
+            )
+
+        cash_mask = _guess_cash_mask(df, caixa_ativos)
+        cash_candidates = df.loc[cash_mask].copy()
+        cash_candidates["asset_value"] = pd.to_numeric(cash_candidates["asset_value"], errors="coerce").fillna(0.0)
+        cash_idx = cash_candidates["asset_value"].abs().idxmax()
+
+        df.at[cash_idx, "asset_value"] -= saque
+
+    # --- DEPÓSITO (cria ativo novo em caixa) ---
+    if deposito > eps:
+        book_caixa = _book_name_caixa_preferido(df)
+        nova = {}
+
+        # mantém colunas que você já usa no app
+        nova["instrument_name"] = "Caixa - Depósito"
+        nova["book_name"] = "Caixa"
+        nova["asset_value"] = deposito
+
+        # se existir exposure, define exposure = deposito (ativo “normal”)
+        value_col = _pick_col(df, ["exposure_value", "last_exposure_value"])
+        if value_col:
+            nova[value_col] = deposito
+
+        # preserva campos mínimos pra não quebrar métricas
+        if "instrument_type_id" in df.columns:
+            nova["instrument_type_id"] = 0  # “outros”/desconhecido (não entra no equity mask)
+
+        # completa colunas faltantes com NaN
+        for c in df.columns:
+            if c not in nova:
+                nova[c] = np.nan
+
+        df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+
+    return _recalc_pct_asset_value(df)  # REUSA
 
 # ======================================================
 # PAGE
@@ -700,12 +771,18 @@ def tela_simulacao() -> None:
     # ================= CONTROLES =================
     with colL:
         st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="h-label">Fluxo externo </div>', unsafe_allow_html=True)
 
-        try:
-            caixa_disp_base = _get_cash_available(df_antes)
-            st.caption(f"Caixa disponível (base): R$ {_format_ptbr_num(caixa_disp_base)}")
-        except RuntimeError:
-            st.caption("Caixa disponível (base): não identificado (ajuste `_guess_cash_mask()`).")
+
+        dep_txt = st.text_input("Depósito (R$)", value="0,00", key="sim_dep_txt")
+        saq_txt = st.text_input("Saque (R$)", value="0,00", key="sim_saq_txt")
+
+        deposito = _parse_ptbr_currency(dep_txt)
+        saque = _parse_ptbr_currency(saq_txt)
+
+
+
 
         st.markdown('<div class="h-label">Ativos</div>', unsafe_allow_html=True)
         sel = st.multiselect(
@@ -791,11 +868,15 @@ def tela_simulacao() -> None:
     # ================= GRÁFICOS (coluna direita) =================
     with colR:
         try:
+            # 1) rebalance (compras/vendas com contrapartida no caixa)
             df_depois = _aplicar_movimentos_rebalance(df_antes, movimentos) if movimentos else df_antes.copy()
 
-
-
-
+            # 2) fluxo externo (depósito/saque) — TEM que vir ANTES do st.metric e das métricas
+            df_depois = _aplicar_deposito_saque(
+                df_depois,
+                deposito=deposito,
+                saque=saque,
+            )
 
         except RuntimeError as re_err:
             if str(re_err) == "CASH_NOT_FOUND":
@@ -807,14 +888,18 @@ def tela_simulacao() -> None:
             _user_error(str(ve))
             return
         except Exception as e:
-            st.error(f"Falha ao aplicar movimentos: {type(e).__name__}: {e}")
-            st.exception(e)  # mostra stacktrace no Streamlit
+            st.error(f"Falha ao aplicar movimentos/fluxo: {type(e).__name__}: {e}")
+            st.exception(e)
             return
 
-
+        # 3) Agora sim: caixa após simulação (já com depósito/saque)
         try:
             caixa_depois = _get_cash_available(df_depois)
             st.metric("Caixa (líquido) após simulação", f"R$ {_format_ptbr_num(caixa_depois)}")
+        except RuntimeError as re_err:
+            if str(re_err) == "CASH_NOT_FOUND":
+                _guide_cash_mask_message()
+                return
         except Exception:
             pass
 
@@ -823,7 +908,7 @@ def tela_simulacao() -> None:
         # ======================================================
         try:
             overview_before = dict(overview or {})
-            overview_after = dict(overview or {})
+            overview_after  = dict(overview or {})
 
             pl_before = float(pd.to_numeric(df_antes.get("asset_value", 0), errors="coerce").fillna(0.0).sum())
             pl_after  = float(pd.to_numeric(df_depois.get("asset_value", 0), errors="coerce").fillna(0.0).sum())
@@ -843,13 +928,11 @@ def tela_simulacao() -> None:
                 overview_before["equity_exposure"] = eq_bef
                 overview_after["equity_exposure"]  = eq_aft
 
-            df_antes_m = _df_sem_caixa(df_antes)
+            df_antes_m  = _df_sem_caixa(df_antes)
             df_depois_m = _df_sem_caixa(df_depois)
 
             m_before = _calcular_metricas_gestao(overview_before, df_antes_m)
             m_after  = _calcular_metricas_gestao(overview_after, df_depois_m)
-
-
 
             if m_before.get("_erro"):
                 raise ValueError(m_before["_erro"])
@@ -860,8 +943,12 @@ def tela_simulacao() -> None:
             _user_error(f"Falha ao recalcular métricas: {e}")
             return
 
-        agg_antes = _agg_por_classe(df_antes)
-        agg_depois = _agg_por_classe(df_depois)
+        # ======================================================
+        # GRÁFICOS
+        # ======================================================
+        agg_antes  = _agg_por_classe(df_antes, include_cash=True)
+        agg_depois = _agg_por_classe(df_depois, include_cash=True)
+
 
         aggA = _consolidar_outros(agg_antes)
         aggB = _consolidar_outros(agg_depois)

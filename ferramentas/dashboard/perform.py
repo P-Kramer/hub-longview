@@ -1,9 +1,10 @@
 # perform.py
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Any, Tuple, Optional
-
+import streamlit.components.v1 as components
 import requests
 import streamlit as st
 import pandas as pd
@@ -30,9 +31,8 @@ BENCHMARK_NAME_TO_ID: Dict[str, int] = {v: k for k, v in BENCHMARKS.items()}
 # --------------------------
 # Janelas (ordem + labels)
 # --------------------------
-WINDOW_ORDER = ["1d", "1m", "3m", "6m", "12m", "24m", "36m", "48m","60m"]
+WINDOW_ORDER = ["1m", "3m", "6m", "12m", "24m", "36m", "48m","60m"]
 WINDOW_LABELS = {
-    "1d": "1 dia",
     "1m": "1 mês",
     "3m": "3 meses",
     "6m": "6 meses",
@@ -183,10 +183,10 @@ def find_dates(d: date) -> List[str]:
         anchors["60m"].isoformat(),
     ]
 
-def _has_window_coverage(cum: pd.DataFrame, end_ts: pd.Timestamp, window: str, min_coverage: float = 0.9) -> tuple[bool, str]:
+def _has_window_coverage(cum: pd.DataFrame, end_ts: pd.Timestamp, window: str, min_coverage: float = 0.99) -> tuple[bool, str]:
     """
     Verifica se há dados suficientes para a janela.
-    min_coverage = 0.9 significa: precisa cobrir pelo menos 90% do período.
+    min_coverage = 0.99 significa: precisa cobrir pelo menos 99% do período.
     Retorna (ok, motivo).
     """
     if cum is None or cum.empty:
@@ -956,14 +956,191 @@ def _render_client_summary_multi(
             styler = t_show.style.apply(lambda _row: _style_row(_row.name), axis=1)
             styler = styler.set_properties(subset=["Benchmark"], **{"font-weight": "600"})
 
-            st.dataframe(
-                styler,
-                use_container_width=True,
-                hide_index=True,
-                key=f"tbl_client_{w}",
-            )
+
+
+            # t é sua tabela NUMÉRICA (não formatada), do jeito que você já monta
+            _render_benchmark_table_html(t)
 
             st.caption(f"Carteira no período: {fmt_pct(c_val)}")
+
+
+def _explode_instrument_positions_with_pnl(df_graf: pd.DataFrame) -> pd.DataFrame:
+    if df_graf is None or df_graf.empty or "instrument_positions" not in df_graf.columns:
+        return pd.DataFrame()
+
+    df = df_graf.copy()
+    df["Data"] = pd.to_datetime(df.get("date"), errors="coerce")
+
+    rows = []
+    for _, r in df.iterrows():
+        dt = r.get("Data")
+        pos = r.get("instrument_positions")
+        if pd.isna(dt) or not isinstance(pos, list):
+            continue
+
+        for p in pos:
+            if not isinstance(p, dict):
+                continue
+
+            name = p.get("instrument_name") or p.get("name") or p.get("instrument_symbol") or p.get("symbol")
+            inst = str(name) if name is not None else None
+            if inst is None:
+                continue
+
+            price = p.get("price") or p.get("unit_price") or p.get("last_price")
+            qty = p.get("quantity") or p.get("shares") or p.get("position")
+            mv  = p.get("asset_value") or p.get("market_value") or p.get("value")
+
+            # PnL total e componentes (se vierem aninhados ou flatten)
+            pnl_total = (
+                p.get("attribution", {}).get("total", {}).get("financial_value")
+                if isinstance(p.get("attribution"), dict) else None
+            )
+            if pnl_total is None:
+                pnl_total = p.get("attribution.total.financial_value") or p.get("attribution_total_financial")
+
+            pnl_beta = (
+                p.get("attribution", {}).get("portfolio_beta", {}).get("financial_value")
+                if isinstance(p.get("attribution"), dict) else None
+            )
+            if pnl_beta is None:
+                pnl_beta = p.get("attribution.portfolio_beta.financial_value") or p.get("attribution_portfolio_beta_financial")
+
+            pnl_fx = (
+                p.get("attribution", {}).get("currency", {}).get("financial_value")
+                if isinstance(p.get("attribution"), dict) else None
+            )
+            if pnl_fx is None:
+                pnl_fx = p.get("attribution.currency.financial_value") or p.get("attribution_currency_financial")
+
+            pnl_ca = (
+                p.get("attribution", {}).get("corp_actions", {}).get("financial_value")
+                if isinstance(p.get("attribution"), dict) else None
+            )
+            if pnl_ca is None:
+                pnl_ca = p.get("attribution.corp_actions.financial_value")
+
+            rows.append({
+                "Data": dt,
+                "Instrumento": inst,
+                "Qty": pd.to_numeric(qty, errors="coerce"),
+                "Preco": pd.to_numeric(price, errors="coerce"),
+                "MarketValue": pd.to_numeric(mv, errors="coerce"),
+                "PnL_Total": pd.to_numeric(pnl_total, errors="coerce"),
+                "PnL_Beta": pd.to_numeric(pnl_beta, errors="coerce"),
+                "PnL_Moeda": pd.to_numeric(pnl_fx, errors="coerce"),
+                "PnL_Eventos": pd.to_numeric(pnl_ca, errors="coerce"),
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.dropna(subset=["Data","Instrumento"]).sort_values(["Instrumento","Data"])
+    return out
+def _render_benchmark_table_html(t_numeric: pd.DataFrame) -> None:
+    def pct(x):
+        return _fmt_pct(x) if pd.notna(x) else "-"
+
+    def pp_str(x):
+        return _fmt_pp(x) if pd.notna(x) else "-"
+
+    def pill_class(v):
+        if pd.isna(v):
+            return "zero"
+        if v > 0:
+            return "pos"
+        if v < 0:
+            return "neg"
+        return "zero"
+
+    rows_html = []
+    for _, r in t_numeric.iterrows():
+        ex = r.get("Excesso (pp)", np.nan)
+        rows_html.append(f"""
+<tr>
+  <td><b>{str(r.get("Benchmark",""))}</b></td>
+  <td class="num">{pct(r.get("Carteira (%)", np.nan))}</td>
+  <td class="num">{pct(r.get("Benchmark (%)", np.nan))}</td>
+  <td class="num"><span class="perf-pill {pill_class(ex)}">{pp_str(ex)}</span></td>
+</tr>
+""")
+
+    html = f"""
+<style>
+.perf-table-card{{
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 10px 12px;
+}}
+.perf-table{{
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 14px;
+}}
+.perf-table thead th{{
+  text-align: left;
+  font-weight: 600;
+  color: rgba(255,255,255,0.75);
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.02);
+}}
+.perf-table tbody td{{
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.88);
+}}
+.perf-table tbody tr:nth-child(odd){{ background: rgba(255,255,255,0.015); }}
+.perf-table tbody tr:hover{{ background: rgba(255,255,255,0.04); }}
+.perf-table .num{{ text-align: right; font-variant-numeric: tabular-nums; }}
+
+.perf-pill{{
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}}
+.perf-pill.pos{{
+  color: #19c37d;
+  background: rgba(25,195,125,0.14);
+  border: 1px solid rgba(25,195,125,0.22);
+}}
+.perf-pill.neg{{
+  color: #ff4d4f;
+  background: rgba(255,77,79,0.14);
+  border: 1px solid rgba(255,77,79,0.22);
+}}
+.perf-pill.zero{{
+  color: rgba(255,255,255,0.70);
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.12);
+}}
+</style>
+
+<div class="perf-table-card">
+  <table class="perf-table">
+    <thead>
+      <tr>
+        <th>Benchmark</th>
+        <th class="num">Carteira (%)</th>
+        <th class="num">Benchmark (%)</th>
+        <th class="num">Excesso (pp)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(rows_html)}
+    </tbody>
+  </table>
+</div>
+"""
+
+    # altura: header + n_linhas*~44 + paddings
+    h = 120 + int(len(t_numeric)) * 44
+    components.html(html, height=h, scrolling=False)
+
 
 
 
@@ -1129,6 +1306,7 @@ def tela_performance() -> None:
             return
 
         d_ini = pd.to_datetime(initial_date, errors="coerce").date()
+        
         if not d_ini:
             st.error("initial_date inválida.")
             return
@@ -1163,6 +1341,7 @@ def tela_performance() -> None:
 
             # ---- ativos: explode + pivot de preço unitário (uma vez só)
             df_long_inst = _explode_instrument_positions(df_graf)
+            df_inst = _explode_instrument_positions_with_pnl(df_graf)  # função que te mandei
             piv_inst_price = _instrument_price_pivot(df_long_inst)
 
         # janelas a plotar (respeita a ordem)
@@ -1198,47 +1377,133 @@ def tela_performance() -> None:
                 st.plotly_chart(fig, use_container_width=True, key=f"graf_perf_{w}")
 
                 last = (sub.iloc[-1] * 100.0).round(2)
-                st.dataframe(last.to_frame("Retorno (%)"), key=f"tbl_perf_{w}")
+                st.dataframe(last.to_frame("Valorização do Ativo (%)"), key=f"tbl_perf_{w}")
+                
 
                 # ----------------
-                # Top 5 / Bottom 5 ativos
+                # Ranking Ativos: Valorização do Ativo vs PnL
                 # ----------------
                 st.divider()
-                st.markdown("#### Melhores e piores ativos no período")
+                st.markdown("#### Ranking de ativos no período")
 
                 off = WINDOW_TO_OFFSET.get(w)
                 start_ts = (pd.Timestamp(end_ts) - off).normalize() if off else sub.index.min()
+                end_ts_ = pd.Timestamp(end_ts)
 
                 if piv_inst_price is None or piv_inst_price.empty:
-                    st.info("Sem dados de ativos (instrument_positions) para montar ranking.")
+                    st.info("Sem dados de ativos (preço) para montar ranking.")
                     continue
 
-                top, bot = _rank_best_worst(
-                    piv_price=piv_inst_price,
-                    start_ts=start_ts,
-                    end_ts=pd.Timestamp(end_ts),
-                    n=5,
-                    min_points=5,
-                )
-
-                c1, c2 = st.columns(2)
-
+                # controles
+                c0, c1, c2 = st.columns([1.6, 1.4, 1.0])
+                with c0:
+                    rank_metric = st.selectbox(
+                        "Critério",
+                        ["Valorização do Ativo", "PnL Total (R$)"],
+                        key=f"rank_metric_{w}",
+                    )
                 with c1:
-                    st.markdown("**Top 5**")
-                    if top.empty:
-                        st.info("Sem dados suficientes para ranking no período.")
-                    else:
-                        top_show = top.copy()
-                        top_show["Retorno (%)"] = (top_show["Retorno"] * 100.0).round(2)
-                        top_show = top_show.drop(columns=["Retorno"])
-                        st.dataframe(top_show, use_container_width=True, key=f"top5_{w}")
-
+                    rank_side = st.selectbox(
+                        "Lado",
+                        ["Top", "Bottom"],
+                        key=f"rank_side_{w}",
+                    )
                 with c2:
-                    st.markdown("**Bottom 5**")
-                    if bot.empty:
-                        st.info("Sem dados suficientes para ranking no período.")
-                    else:
-                        bot_show = bot.copy()
-                        bot_show["Retorno (%)"] = (bot_show["Retorno"] * 100.0).round(2)
-                        bot_show = bot_show.drop(columns=["Retorno"])
-                        st.dataframe(bot_show, use_container_width=True, key=f"bot5_{w}")
+                    n_rank = st.number_input(
+                        "N",
+                        min_value=3,
+                        max_value=50,
+                        value=5,
+                        step=1,
+                        key=f"rank_n_{w}",
+                    )
+
+                # -----------------------------
+                # 1) Retorno por preço no período (sempre calculo, pra poder cruzar)
+                # -----------------------------
+                sub_price = piv_inst_price.loc[(piv_inst_price.index >= start_ts) & (piv_inst_price.index <= end_ts_)].copy()
+                sub_price = sub_price.dropna(axis=1, how="all")
+
+                if sub_price.empty:
+                    st.info("Sem dados de preço no período para ranking.")
+                    continue
+
+                first = sub_price.apply(lambda s: s.dropna().iloc[0] if s.dropna().shape[0] else np.nan, axis=0)
+                last  = sub_price.apply(lambda s: s.dropna().iloc[-1] if s.dropna().shape[0] else np.nan, axis=0)
+                ret = (last / first - 1.0).replace([np.inf, -np.inf], np.nan)
+
+                ret_df = ret.dropna().to_frame("Retorno")
+                ret_df.index.name = "Instrumento"
+                ret_df = ret_df.reset_index()
+
+                # -----------------------------
+                # 2) PnL total no período (se tiver df_inst com PnL_Total)
+                # -----------------------------
+                pnl_df = pd.DataFrame(columns=["Instrumento", "PnL_Total"])
+
+                if "df_inst" in locals() and df_inst is not None and not df_inst.empty and "PnL_Total" in df_inst.columns:
+                    sub_pnl = df_inst[(df_inst["Data"] >= start_ts) & (df_inst["Data"] <= end_ts_)].copy()
+                    sub_pnl["PnL_Total"] = pd.to_numeric(sub_pnl["PnL_Total"], errors="coerce")
+                    pnl_df = pd.DataFrame(columns=["Instrumento", "PnL_Total", "Qty_fim"])
+
+                    if df_inst is not None and not df_inst.empty and "PnL_Total" in df_inst.columns:
+                        sub_pnl = df_inst[(df_inst["Data"] >= start_ts) & (df_inst["Data"] <= end_ts_)].copy()
+                        sub_pnl["PnL_Total"] = pd.to_numeric(sub_pnl["PnL_Total"], errors="coerce")
+                        sub_pnl["Qty"] = pd.to_numeric(sub_pnl["Qty"], errors="coerce")
+
+                        # soma PnL no período
+                        pnl_sum = (
+                            sub_pnl.dropna(subset=["Instrumento"])
+                                .groupby("Instrumento", as_index=False)["PnL_Total"]
+                                .sum()
+                        )
+
+                        # qty no fim do período (última linha por instrumento)
+                        qty_end = (
+                            sub_pnl.sort_values(["Instrumento", "Data"])
+                                .groupby("Instrumento", as_index=False)
+                                .tail(1)[["Instrumento", "Qty"]]
+                                .rename(columns={"Qty": "Qty_fim"})
+                        )
+
+                        pnl_df = pnl_sum.merge(qty_end, on="Instrumento", how="left")
+
+
+                # junta retorno + pnl
+                rank = ret_df.merge(pnl_df, on="Instrumento", how="left")
+
+                # formata colunas auxiliares
+                rank["Valorização do Ativo (%)"] = (rank["Retorno"] * 100.0).round(2)
+
+                rank["Qty_fim"] = pd.to_numeric(rank.get("Qty_fim"), errors="coerce")
+
+                rank["Posição"] = np.where(
+                    rank["Qty_fim"].fillna(0) > 0, "Comprado",
+                    np.where(rank["Qty_fim"].fillna(0) < 0, "Vendido", "Zerado")
+)
+
+
+                # ordenação conforme critério
+                if rank_metric == "Valorização do Ativo":
+                    # Top = maiores retornos, Bottom = menores retornos
+                    rank = rank.dropna(subset=["Retorno"])
+                    ascending = (rank_side == "Bottom")
+                    rank = rank.sort_values("Retorno", ascending=ascending).head(int(n_rank))
+                else:
+                    # PnL: Top = maior pnl, Bottom = menor pnl
+                    rank = rank.dropna(subset=["PnL_Total"])
+                    ascending = (rank_side == "Bottom")
+                    rank = rank.sort_values("PnL_Total", ascending=ascending).head(int(n_rank))
+
+                # exibição (mantém as duas infos)
+                show_cols = ["Instrumento", "Posição", "Valorização do Ativo (%)"]
+
+                if "PnL_Total" in rank.columns:
+                    show_cols.append("PnL_Total")
+                rank_show = rank[show_cols].copy()
+
+                # arredonda PnL para ficar legível
+                if "PnL_Total" in rank_show.columns:
+                    rank_show["PnL_Total"] = pd.to_numeric(rank_show["PnL_Total"], errors="coerce").round(2)
+
+                st.dataframe(rank_show, use_container_width=True, hide_index=True, key=f"rank_table_{w}")

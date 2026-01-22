@@ -8,6 +8,8 @@ from utils import BASE_URL_API, CLIENT_ID, CLIENT_SECRET
 from ferramentas.compara_relatorios.router import render as render_compara_relatorios
 from ferramentas.dashboard.router import render as render_dashboard
 from ferramentas.carteiras.router import render as render_carteiras
+from ferramentas.overview.router import render as render_overview
+
 
 
 
@@ -110,9 +112,11 @@ ctx = Ctx()
 # APPS (UI nome bonito, ID nome limpo)
 # =========================
 APPS = [
-    {"id": "carteiras",          "nome": "Carteiras",          "icone": "🗂️", "render": render_carteiras},
     {"id": "dashboard",          "nome": "Dashboard",          "icone": "📊", "render": render_dashboard},
+    {"id": "overview",           "nome": "Overview",           "icone": "🧭", "render": render_overview},
+    {"id": "carteiras",          "nome": "Carteiras",          "icone": "🗂️", "render": render_carteiras},
     {"id": "compara_relatorios", "nome": "Compara Relatórios", "icone": "🧾", "render": render_compara_relatorios},
+
 ]
 
 # =========================
@@ -218,13 +222,9 @@ def tela_hub():
     st.caption("Escolha uma aplicação para continuar")
     st.divider()
 
-    # Grid 2x2 SEM link (sem abrir nova aba)
-    col1, col2, col3 = st.columns(3, gap="large")
-    
-    slots = [col1, col2, col3]
-
-    for slot, app in zip(slots, APPS):
-        with slot:
+    cols = st.columns(2, gap="large")
+    for i, app in enumerate(APPS):
+        with cols[i % 2]:
             with st.container(border=True):
                 st.markdown(
                     f"""
@@ -233,7 +233,6 @@ def tela_hub():
                         <div style="margin-top:10px; font-weight:650; font-size:1.05rem;">
                             {app['nome']}
                         </div>
-               
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -241,9 +240,10 @@ def tela_hub():
 
                 if st.button("Abrir", key=f"open_{app['id']}", use_container_width=True):
                     st.query_params.clear()
-                    st.query_params["app"] = app["id"]   # mantém seu fluxo atual (?app=...)
+                    st.query_params["app"] = app["id"]
                     ir_para(f"app:{app['id']}")
                     st.rerun()
+
 
 
 def tela_app(app_id: str):
