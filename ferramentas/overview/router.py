@@ -178,6 +178,78 @@ def _search_asset(df_long: pd.DataFrame, query: str, exact: bool = False) -> pd.
 
     return g.sort_values("asset_value", ascending=False).drop(columns=["pl"])
 
+import io
+
+def _excel_bytes_formatado(
+    sheets: list[tuple[str, pd.DataFrame, bool, dict[str, str]]]
+) -> bytes:
+    """
+    sheets: lista de tuplas (nome_aba, df, index, col_formats)
+      - col_formats: dict col_name -> tipo ("text"|"brl"|"pct0_1"|"pct0_2"|"num2")
+        pct0_1 = percentual em 0..1 (ex: 0.187) -> 18,7%
+        pct0_2 = percentual em 0..100 (ex: 18.7) -> 18,7%
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        fmt_title = wb.add_format({"bold": True, "font_size": 12})
+        fmt_header = wb.add_format({
+            "bold": True, "font_color": "white", "bg_color": "#111827",
+            "align": "center", "valign": "vcenter"
+        })
+        fmt_text = wb.add_format({"align": "left", "valign": "vcenter"})
+        fmt_num2 = wb.add_format({"num_format": "#,##0.00", "valign": "vcenter"})
+        fmt_brl  = wb.add_format({"num_format": u'R$ #,##0.00', "valign": "vcenter"})
+        fmt_pct01 = wb.add_format({"num_format": "0.00%", "valign": "vcenter"})     # 0..1
+        fmt_pct02 = wb.add_format({"num_format": '0.00"%"', "valign": "vcenter"})  # 0..100 (número 18.7)
+
+        def _autowidth(ws, df, start_col=0, max_w=55, min_w=10):
+            for i, col in enumerate(df.columns):
+                vals = [str(col)]
+                if not df.empty:
+                    vals += df[col].head(200).astype(str).tolist()
+                w = min(max_w, max(min_w, max(len(v) for v in vals) + 2))
+                ws.set_column(start_col + i, start_col + i, w)
+
+        for sheet_name, df, index, col_formats in sheets:
+            df.to_excel(writer, sheet_name=sheet_name, index=index)
+            ws = writer.sheets[sheet_name]
+            ws.hide_gridlines(2)
+            ws.set_default_row(18)
+
+            # header
+            header_row = 0
+            for c, colname in enumerate(df.columns if not index else ["index"] + list(df.columns)):
+                ws.write(header_row, c, colname, fmt_header)
+
+            # freeze + filter
+            ws.freeze_panes(1, 0)
+            last_row = len(df) if len(df) > 0 else 1
+            last_col = (len(df.columns) - 1) + (1 if index else 0)
+            ws.autofilter(0, 0, last_row, last_col)
+
+            # formatos por coluna (respeita index)
+            offset = 1 if index else 0
+            for col, typ in (col_formats or {}).items():
+                if col not in df.columns:
+                    continue
+                j = df.columns.get_loc(col) + offset
+                if typ == "text":
+                    ws.set_column(j, j, None, fmt_text)
+                elif typ == "brl":
+                    ws.set_column(j, j, None, fmt_brl)
+                elif typ == "num2":
+                    ws.set_column(j, j, None, fmt_num2)
+                elif typ == "pct0_1":
+                    ws.set_column(j, j, None, fmt_pct01)
+                elif typ == "pct0_2":
+                    ws.set_column(j, j, None, fmt_pct02)
+
+            # largura
+            _autowidth(ws, df, start_col=(1 if index else 0))
+
+    return buf.getvalue()
 
 
 # =========================
@@ -320,28 +392,50 @@ def render(ctx) -> None:
 
 
 
-    # tabela de apoio (top linhas)
     with st.expander("Tabela (% por classe)"):
-        show = piv.copy()
-        st.dataframe((show * 100).round(2), use_container_width=True)
+        show = piv.copy()                 # piv é 0..1
+        show_pct = (show * 100).round(2)  # só pra visualizar
 
+        st.dataframe(show_pct, use_container_width=True)
+
+        # Excel: uma aba numérica (0..1) + uma aba em 0..100 (pra leitura)
+        df_num = show.copy()  # 0..1
+        df_100 = (show * 100.0)  # 0..100
+
+        xls = _excel_bytes_formatado([
+            ("heatmap_pct_01", df_num, True, {c: "pct0_1" for c in df_num.columns}),
+            ("heatmap_pct_100", df_100, True, {c: "pct0_2" for c in df_100.columns}),
+        ])
+
+        st.download_button(
+            "Baixar tabela (% por classe) — Excel",
+            data=xls,
+            file_name=f"overview_heatmap_pct_{str(data_base)}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="ov_dl_heatmap_xlsx",
+        )
+
+
+
+        st.divider()
+
+        # =========================
+        # BUSCA POR ATIVO
+        # =========================
+        st.markdown("#### Buscar ativo — onde está e quanto tem")
+
+        # lista única de ativos (uma vez)
+        ativos_unicos = sorted(
+            df_long["instrument_name"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
     st.divider()
-
-    # =========================
-    # BUSCA POR ATIVO
-    # =========================
-    st.markdown("#### Buscar ativo — onde está e quanto tem")
-
-    # lista única de ativos (uma vez)
-    ativos_unicos = sorted(
-        df_long["instrument_name"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
     # SELECTBOX com autocomplete NATIVO
+    st.subheader ("Busca por Ativo")
     ativo_sel = st.selectbox(
         "Digite para buscar o ativo",
         options=[""] + ativos_unicos,

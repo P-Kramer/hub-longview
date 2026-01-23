@@ -113,7 +113,7 @@ ctx = Ctx()
 # =========================
 APPS = [
     {"id": "dashboard",          "nome": "Dashboard",          "icone": "📊", "render": render_dashboard},
-    {"id": "overview",           "nome": "Overview",           "icone": "🧭", "render": render_overview},
+    {"id": "overview",           "nome": "Overview",           "icone": "🔎", "render": render_overview},
     {"id": "carteiras",          "nome": "Carteiras",          "icone": "🗂️", "render": render_carteiras},
     {"id": "compara_relatorios", "nome": "Compara Relatórios", "icone": "🧾", "render": render_compara_relatorios},
 
