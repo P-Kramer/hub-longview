@@ -58,6 +58,46 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def _is_deriv_row(df: pd.DataFrame, row_idx: int) -> bool:
+    """
+    Decide se uma linha é derivativo (opção/futuro).
+    Usa instrument_type/instrument_type_name quando existir.
+    Senão usa instrument_type_id (se você configurar).
+    Senão fallback por heurística de exposure vs asset.
+    """
+    if df is None or df.empty or row_idx not in df.index:
+        return False
+
+    # 1) por texto
+    col_txt = _pick_col(df, ["instrument_type", "instrument_type_name", "instrument_type_desc"])
+    print(df)
+    if col_txt:
+        s = str(df.at[row_idx, col_txt] or "").strip().lower()
+        
+        if re.search(r"\b(5|4)\b", s):
+            return True
+
+    # 2) por id (ajuste quando souber)
+    if "instrument_type_id" in df.columns:
+        it = pd.to_numeric(df.at[row_idx, "instrument_type_id"], errors="coerce")
+        if pd.notna(it):
+            it = int(it)
+            OPCOES_IDS: set[int] = set()
+            FUTUROS_IDS: set[int] = set()
+            if (OPCOES_IDS or FUTUROS_IDS) and it in (OPCOES_IDS | FUTUROS_IDS):
+                return True
+
+    # 3) fallback por característica: asset ~ 0 e exposure grande
+    valcol = _pick_col(df, ["exposure_value", "last_exposure_value"])
+    if not valcol:
+        return False
+
+    av = float(pd.to_numeric(df.at[row_idx, "asset_value"], errors="coerce") or 0.0)
+    ex = float(pd.to_numeric(df.at[row_idx, valcol], errors="coerce") or 0.0)
+    eps = 1e-6
+    return (abs(av) < eps and abs(ex) > eps)
+
+
 def _user_error(msg: str):
     st.error(msg)
 
@@ -300,13 +340,19 @@ def _debug_top_exposures(df, label):
 # ======================================================
 def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict]) -> pd.DataFrame:
     """
-    REGRAS (CORRETAS):
-    - Altera SOMENTE asset_value (financeiro)
-    - Contrapartida SEMPRE no caixa
-    - exposure_value:
-        * só é ajustado para ativos "normais" (exposure ~ asset)
-        * NUNCA é ajustado para futuros / hedge (asset ~ 0, exposure grande)
-        * NUNCA é ajustado para caixa
+    REGRAS (DO JEITO QUE VOCÊ PEDIU):
+    - NÃO-derivativo:
+        * delta é ΔFINANCEIRO (R$)
+        * altera asset_value
+        * contrapartida SEMPRE no caixa
+        * trava venda > posição e compra > caixa
+        * exposure_value acompanha (exposure += delta) para ativo “normal”
+    - Derivativo (futuro/opção):
+        * delta é ΔEXPOSIÇÃO (R$)
+        * altera SOMENTE exposure_value (ou last_exposure_value)
+        * NÃO mexe em asset_value
+        * NÃO mexe em caixa
+        * NÃO tem trava (se exp = -100 e digita -100, vira -200)
     """
 
     if df_base is None or df_base.empty:
@@ -362,15 +408,29 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
     for mv in movs:
         nome = mv["instrument_name"]
         classe = mv["book_name"]
-        delta = mv["delta"]
+        delta = float(mv["delta"])
 
         filtro = (df["_iname"] == nome) & (df["_bname"] == classe)
-
+        
         # trava ambiguidade (OBRIGATÓRIO)
         if filtro.sum() != 1:
             raise ValueError(
                 f"Movimento ambíguo: '{nome}' em '{classe}' bateu em {int(filtro.sum())} linhas."
             )
+
+        row_idx = df.index[filtro][0]
+        is_deriv = _is_deriv_row(df, row_idx)
+
+        # ==========================
+        # DERIVATIVO: mexe SÓ exposure
+        # ==========================
+        if is_deriv:
+            df.loc[filtro, value_col] += delta
+            continue  # sem trava, sem caixa, sem asset_value
+
+        # ==========================
+        # NÃO-DERIVATIVO: fluxo normal
+        # ==========================
 
         # VENDA: trava por posição
         if delta < 0:
@@ -391,20 +451,13 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
                     f"Disponível: R$ {_format_ptbr_num(caixa_disp)}."
                 )
 
-        # ===== APLICA FINANCEIRO =====
+        # ===== APLICA FINANCEIRO (com contrapartida no caixa) =====
         df.loc[filtro, "asset_value"] += delta
         df.at[cash_idx, "asset_value"] -= delta
 
-        # ===== EXPOSURE: SÓ SE FOR ATIVO NORMAL =====
-        av = float(df.loc[filtro, "asset_value"].sum())
-        ex = float(df.loc[filtro, value_col].sum())
-
-        # derivativo típico: asset ~ 0 e exposure grande
-        is_deriv_like = (abs(av) < eps and abs(ex) > eps)
-
-        if not is_deriv_like:
-            df.loc[filtro, value_col] += delta
-        # caixa e derivativos NÃO são mexidos
+        # ===== EXPOSURE acompanha para ativo “normal” (não-caixa) =====
+        # Para ativo normal, exposure ~ asset. Então seguimos com exposure += delta.
+        df.loc[filtro, value_col] += delta
 
     # NÃO remova derivativos: asset_value pode ser 0, mas exposure é relevante
     exp_col = _pick_col(df, ["exposure_value", "last_exposure_value"])
@@ -413,11 +466,11 @@ def _aplicar_movimentos_rebalance(df_base: pd.DataFrame, movimentos: list[dict])
     else:
         df = df[df["asset_value"].abs() > 1e-6].reset_index(drop=True)
 
-
     # limpa auxiliares
     df = df.drop(columns=[c for c in ["_iname", "_bname"] if c in df.columns], errors="ignore")
 
     return _recalc_pct_asset_value(df)
+
 
 
 
@@ -451,7 +504,12 @@ def _excel_simulacao(
     df_antes: pd.DataFrame, df_depois: pd.DataFrame,
     metricas_antes: dict, metricas_depois: dict
 ) -> bytes:
-    delta = pd.merge(agg_antes, agg_depois, on="book_name", how="outer", suffixes=("_bef", "_aft")).fillna(0)
+    # ---------- prepara dataframes ----------
+    delta = pd.merge(
+        agg_antes, agg_depois,
+        on="book_name", how="outer", suffixes=("_bef", "_aft")
+    ).fillna(0)
+
     delta["Δ Financeiro (R$)"] = delta["asset_value_aft"] - delta["asset_value_bef"]
     delta["Δ p.p."] = (delta["pct_aft"] - delta["pct_bef"]) * 100
 
@@ -471,19 +529,190 @@ def _excel_simulacao(
         met_rows.append({"Métrica": k, "Antes": a, "Depois": b, "Delta": b - a})
     met_df = pd.DataFrame(met_rows)
 
+    df_res_antes = agg_antes.rename(columns={"book_name": "Classe", "asset_value": "Financeiro", "pct": "%_Alocado"}).copy()
+    df_res_depois = agg_depois.rename(columns={"book_name": "Classe", "asset_value": "Financeiro", "pct": "%_Alocado"}).copy()
+    df_delta_classes = delta.rename(columns={"book_name": "Classe"}).copy()
+
+    def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> None:
+        for c in cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    _safe_to_numeric(df_res_antes, ["Financeiro", "%_Alocado"])
+    _safe_to_numeric(df_res_depois, ["Financeiro", "%_Alocado"])
+    _safe_to_numeric(df_delta_classes, ["asset_value_bef", "asset_value_aft", "pct_bef", "pct_aft", "Δ Financeiro (R$)", "Δ p.p."])
+    _safe_to_numeric(met_df, ["Antes", "Depois", "Delta"])
+
+    # ---------- writer ----------
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        agg_antes.rename(columns={"book_name": "Classe", "asset_value": "Financeiro", "pct": "%_Alocado"}).to_excel(
-            writer, index=False, sheet_name="Resumo_antes"
-        )
-        agg_depois.rename(columns={"book_name": "Classe", "asset_value": "Financeiro", "pct": "%_Alocado"}).to_excel(
-            writer, index=False, sheet_name="Resumo_depois"
-        )
-        delta.rename(columns={"book_name": "Classe"}).to_excel(writer, index=False, sheet_name="Delta_Classes")
+        wb = writer.book
+
+        # formatos
+        fmt_header = wb.add_format({
+            "bold": True,
+            "font_color": "white",
+            "bg_color": "#111827",
+            "align": "center",
+            "valign": "vcenter",
+        })
+        fmt_section = wb.add_format({
+            "bold": True,
+            "font_color": "white",
+            "bg_color": "#1F2937",
+            "align": "left",
+            "valign": "vcenter",
+        })
+        fmt_text = wb.add_format({"align": "left", "valign": "vcenter"})
+        fmt_brl = wb.add_format({"num_format": u'R$ #,##0.00', "valign": "vcenter"})
+        fmt_pct = wb.add_format({"num_format": "0.00%", "valign": "vcenter"})
+        fmt_pp = wb.add_format({"num_format": '0.00" p.p."', "valign": "vcenter"})
+        fmt_neg = wb.add_format({"font_color": "#B91C1C"})
+        fmt_pos = wb.add_format({"font_color": "#047857"})
+
+        def _autowidth(ws, df, start_col=0, max_w=52, min_w=10):
+            for i, col in enumerate(df.columns):
+                s = [str(col)]
+                if not df.empty:
+                    s.extend(df[col].head(200).astype(str).tolist())
+                w = max(len(x) for x in s)
+                w = max(min_w, min(max_w, w + 2))
+                ws.set_column(start_col + i, start_col + i, w)
+
+        def _write_df(ws, df, start_row: int, start_col: int, *, header=True) -> int:
+            """Escreve df em ws a partir de (start_row, start_col). Retorna última linha escrita."""
+            if header:
+                for c, name in enumerate(df.columns):
+                    ws.write(start_row, start_col + c, name, fmt_header)
+                data_row0 = start_row + 1
+            else:
+                data_row0 = start_row
+
+            # dados
+            for r in range(len(df)):
+                for c, colname in enumerate(df.columns):
+                    v = df.iloc[r, c]
+                    if pd.isna(v):
+                        ws.write_blank(data_row0 + r, start_col + c, None)
+                        continue
+                    if isinstance(v, (int, float, np.integer, np.floating)):
+                        # padrão numérico genérico; vamos sobrepor formatos por coluna depois
+                        ws.write_number(data_row0 + r, start_col + c, float(v))
+                    else:
+                        ws.write(data_row0 + r, start_col + c, str(v), fmt_text)
+
+            last_row = data_row0 + max(0, len(df) - 1)
+            return last_row
+
+        def _apply_col_formats(ws, df, start_col: int, col_formats: dict[str, Any]):
+            for col_name, f in col_formats.items():
+                if col_name in df.columns:
+                    idx = df.columns.get_loc(col_name)
+                    ws.set_column(start_col + idx, start_col + idx, None, f)
+
+        def _conditional_sign(ws, first_row, last_row, col_idx_abs):
+            ws.conditional_format(first_row, col_idx_abs, last_row, col_idx_abs,
+                                  {"type": "cell", "criteria": ">", "value": 0, "format": fmt_pos})
+            ws.conditional_format(first_row, col_idx_abs, last_row, col_idx_abs,
+                                  {"type": "cell", "criteria": "<", "value": 0, "format": fmt_neg})
+
+        # ===============================
+        # ABA ÚNICA: RESUMO (ANTES + DEPOIS)
+        # ===============================
+        sheet_name = "Resumo"
+        df_empty = pd.DataFrame({"_": []})  # só pra criar a sheet
+        df_empty.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+        ws.hide_gridlines(2)
+        ws.set_default_row(18)
+
+        row = 0
+        col_left = 0
+        col_right = len(df_res_antes.columns) + 2  # gap
+
+        # Título seção ANTES
+        ws.merge_range(row, col_left, row, col_left + len(df_res_antes.columns) - 1, "ANTES", fmt_section)
+        row += 1
+        last_left = _write_df(ws, df_res_antes, row, col_left, header=True)
+        _apply_col_formats(ws, df_res_antes, col_left, {"Classe": fmt_text, "Financeiro": fmt_brl, "%_Alocado": fmt_pct})
+        _autowidth(ws, df_res_antes, start_col=col_left)
+
+        # Título seção DEPOIS (mesma altura do antes)
+        ws.merge_range((row - 1), col_right, (row - 1), col_right + len(df_res_depois.columns) - 1, "DEPOIS", fmt_section)
+        last_right = _write_df(ws, df_res_depois, row, col_right, header=True)
+        _apply_col_formats(ws, df_res_depois, col_right, {"Classe": fmt_text, "Financeiro": fmt_brl, "%_Alocado": fmt_pct})
+        _autowidth(ws, df_res_depois, start_col=col_right)
+
+        # freeze no header (linha do df)
+        ws.freeze_panes(row + 1, 0)
+
+        # autofilter para os dois blocos
+        ws.autofilter(row, col_left, last_left, col_left + len(df_res_antes.columns) - 1)
+        ws.autofilter(row, col_right, last_right, col_right + len(df_res_depois.columns) - 1)
+
+        # ===============================
+        # ABA: DELTA CLASSES
+        # ===============================
+        df_delta_classes.to_excel(writer, index=False, sheet_name="Delta_Classes")
+        ws2 = writer.sheets["Delta_Classes"]
+        ws2.hide_gridlines(2)
+        ws2.set_default_row(18)
+
+        # header
+        for c, name in enumerate(df_delta_classes.columns):
+            ws2.write(0, c, name, fmt_header)
+        ws2.freeze_panes(1, 0)
+        ws2.autofilter(0, 0, max(0, len(df_delta_classes)), max(0, len(df_delta_classes.columns) - 1))
+        _autowidth(ws2, df_delta_classes, start_col=0)
+
+        _apply_col_formats(ws2, df_delta_classes, 0, {
+            "Classe": fmt_text,
+            "asset_value_bef": fmt_brl,
+            "asset_value_aft": fmt_brl,
+            "pct_bef": fmt_pct,
+            "pct_aft": fmt_pct,
+            "Δ Financeiro (R$)": fmt_brl,
+            "Δ p.p.": fmt_pp,
+        })
+
+        # sinal no delta
+        if "Δ Financeiro (R$)" in df_delta_classes.columns:
+            col = df_delta_classes.columns.get_loc("Δ Financeiro (R$)")
+            _conditional_sign(ws2, 1, len(df_delta_classes), col)
+        if "Δ p.p." in df_delta_classes.columns:
+            col = df_delta_classes.columns.get_loc("Δ p.p.")
+            _conditional_sign(ws2, 1, len(df_delta_classes), col)
+
+        # ===============================
+        # ABA: DELTA METRICAS
+        # ===============================
         met_df.to_excel(writer, index=False, sheet_name="Delta_Metricas")
-        df_antes.to_excel(writer, index=False, sheet_name="Raw_antes")
-        df_depois.to_excel(writer, index=False, sheet_name="Raw_depois")
+        ws3 = writer.sheets["Delta_Metricas"]
+        ws3.hide_gridlines(2)
+        ws3.set_default_row(18)
+
+        for c, name in enumerate(met_df.columns):
+            ws3.write(0, c, name, fmt_header)
+        ws3.freeze_panes(1, 0)
+        ws3.autofilter(0, 0, max(0, len(met_df)), max(0, len(met_df.columns) - 1))
+        ws3.set_column(0, 0, 44, fmt_text)
+
+        # reescreve números por linha com formato correto (%, ou R$)
+        for r in range(1, len(met_df) + 1):
+            met_name = str(met_df.iloc[r - 1]["Métrica"])
+            is_percent = ("%" in met_name)
+            f = fmt_pct if is_percent else fmt_brl
+            ws3.write_number(r, 1, float(met_df.iloc[r - 1]["Antes"] or 0), f)
+            ws3.write_number(r, 2, float(met_df.iloc[r - 1]["Depois"] or 0), f)
+            ws3.write_number(r, 3, float(met_df.iloc[r - 1]["Delta"] or 0), f)
+
+        # cor no delta
+        if "Delta" in met_df.columns:
+            col = met_df.columns.get_loc("Delta")
+            _conditional_sign(ws3, 1, len(met_df), col)
+
     return buf.getvalue()
+
 
 
 # ======================================================
@@ -504,22 +733,51 @@ def _init_state():
 # UI: MÉTRICAS COMPARATIVAS (resumo)
 # ======================================================
 def _render_metricas_resumo(m_before: dict, m_after: dict):
-   
+    eps = 1e-9
 
     def g(m, k):
         if k not in m:
             raise KeyError(f"Métrica ausente: '{k}'")
-        return float(m[k])
+        return float(m[k] or 0.0)
 
-    def fmt_brl(v):
+    def fmt_brl(v: float) -> str:
         return f"{v:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    def delta_brl(a, b):
-        return f"Δ R$ {fmt_brl(b - a)}"
+    def fmt_pct(v: float) -> str:
+        # v já vem em % (ex: 18.7). você quer 18,7%
+        return f"{v:.1f}".replace(".", ",")
 
-    def delta_pp(a, b):
-        return f"{(b - a):+.2f} p.p."
+    def delta_color_num(d: float) -> str:
+        # "normal": + verde, - vermelho
+        # "off": sem cor (pra zero)
+        if abs(d) <= eps:
+            return "off"
+        return "normal"
+    def caption_delta_pp(d_pct: float, *, eps: float = 1e-6):
+        if abs(d_pct) <= eps:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            return
 
+        color = "#0cf862" if d_pct > 0 else "#ff0000"  # verde | vermelho
+        txt = f"{d_pct:+.2f} p.p.".replace(".", ",")
+
+        st.markdown(
+            f"<div style='color:{color}; font-size:0.85rem; margin-top:-6px'>{txt}</div>",
+            unsafe_allow_html=True,
+        )
+
+    def metric_val_pct(title: str, val_bef: float, val_aft: float, pct_bef: float, pct_aft: float):
+        d_val = val_aft - val_bef
+        d_pct = pct_aft - pct_bef
+
+        st.metric(
+            title,
+            f"R$ {fmt_brl(val_aft)} ({fmt_pct(pct_aft)}%)",
+            delta=d_val,  # NUMÉRICO -> cor correta
+            delta_color=delta_color_num(d_val),
+        )
+
+        caption_delta_pp(d_pct)
     # ================= LINHA 1 =================
     c1, c2, c3 = st.columns(3)
 
@@ -527,16 +785,12 @@ def _render_metricas_resumo(m_before: dict, m_after: dict):
         pl_a, pl_b = g(m_before, "PL"), g(m_after, "PL")
         rv_a, rv_b = g(m_before, "Enquadramento RV (%)"), g(m_after, "Enquadramento RV (%)")
 
-        st.metric(
-            "PL",
-            f"R$ {fmt_brl(pl_b)}",
-            delta=delta_brl(pl_a, pl_b),
-        )
-        st.metric(
-            "Enquadramento RV",
-            f"{rv_b:.1f}%",
-            delta=delta_pp(rv_a, rv_b),
-        )
+        # PL não tem % ao lado (se quiser, me diga qual % é)
+        d_pl = pl_b - pl_a
+        st.metric("PL", f"R$ {fmt_brl(pl_b)}", delta=d_pl, delta_color=delta_color_num(d_pl))
+
+        d_rv = rv_b - rv_a
+        st.metric("Enquadramento RV", f"{fmt_pct(rv_b)}%", delta=d_rv, delta_color=delta_color_num(d_rv))
 
     with c2:
         a, b = g(m_before, "Exp. Bruta RV Brasil"), g(m_after, "Exp. Bruta RV Brasil")
@@ -548,21 +802,9 @@ def _render_metricas_resumo(m_before: dict, m_after: dict):
         l_a, l_b = g(m_before, "Exp. Líquida RV Brasil"), g(m_after, "Exp. Líquida RV Brasil")
         lp_a, lp_b = g(m_before, "Exp. Líquida RV Brasil %"), g(m_after, "Exp. Líquida RV Brasil %")
 
-        st.metric(
-            "Exp. Bruta RV Brasil",
-            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
-            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
-        )
-        st.metric(
-            "HEDGE ÍNDICE BR",
-            f"R$ {fmt_brl(h_b)} ({hp_b:.1f}%)",
-            delta=f"{delta_brl(h_a, h_b)} | {delta_pp(hp_a, hp_b)}",
-        )
-        st.metric(
-            "Exp. Líquida RV Brasil",
-            f"R$ {fmt_brl(l_b)} ({lp_b:.1f}%)",
-            delta=f"{delta_brl(l_a, l_b)} | {delta_pp(lp_a, lp_b)}",
-        )
+        metric_val_pct("Exp. Bruta RV Brasil", a, b, ap, bp)
+        metric_val_pct("HEDGE ÍNDICE BR", h_a, h_b, hp_a, hp_b)
+        metric_val_pct("Exp. Líquida RV Brasil", l_a, l_b, lp_a, lp_b)
 
     with c3:
         a, b = g(m_before, "Exp. Bruta RV Global"), g(m_after, "Exp. Bruta RV Global")
@@ -574,21 +816,9 @@ def _render_metricas_resumo(m_before: dict, m_after: dict):
         l_a, l_b = g(m_before, "Exp. Líquida RV Global"), g(m_after, "Exp. Líquida RV Global")
         lp_a, lp_b = g(m_before, "Exp. Líquida RV Global %"), g(m_after, "Exp. Líquida RV Global %")
 
-        st.metric(
-            "Exp. Bruta RV Global",
-            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
-            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
-        )
-        st.metric(
-            "HEDGE ÍNDICE Global",
-            f"R$ {fmt_brl(h_b)} ({hp_b:.1f}%)",
-            delta=f"{delta_brl(h_a, h_b)} | {delta_pp(hp_a, hp_b)}",
-        )
-        st.metric(
-            "Exp. Líquida RV Global",
-            f"R$ {fmt_brl(l_b)} ({lp_b:.1f}%)",
-            delta=f"{delta_brl(l_a, l_b)} | {delta_pp(lp_a, lp_b)}",
-        )
+        metric_val_pct("Exp. Bruta RV Global", a, b, ap, bp)
+        metric_val_pct("HEDGE ÍNDICE Global", h_a, h_b, hp_a, hp_b)
+        metric_val_pct("Exp. Líquida RV Global", l_a, l_b, lp_a, lp_b)
 
     st.markdown("---")
 
@@ -598,22 +828,13 @@ def _render_metricas_resumo(m_before: dict, m_after: dict):
     with c4:
         a, b = g(m_before, "HEDGE DOL"), g(m_after, "HEDGE DOL")
         ap, bp = g(m_before, "HEDGE DOL %"), g(m_after, "HEDGE DOL %")
-
-        st.metric(
-            "HEDGE Dólar",
-            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
-            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
-        )
+        metric_val_pct("HEDGE Dólar", a, b, ap, bp)
 
     with c5:
         a, b = g(m_before, "Net Dólar"), g(m_after, "Net Dólar")
         ap, bp = g(m_before, "Net Dólar %"), g(m_after, "Net Dólar %")
+        metric_val_pct("Net Dólar", a, b, ap, bp)
 
-        st.metric(
-            "Net Dólar",
-            f"R$ {fmt_brl(b)} ({bp:.1f}%)",
-            delta=f"{delta_brl(a, b)} | {delta_pp(ap, bp)}",
-        )
 
 
 
@@ -697,7 +918,10 @@ def _aplicar_deposito_saque(df: pd.DataFrame, deposito: float, saque: float) -> 
 # ======================================================
 def tela_simulacao() -> None:
     st.markdown("### Simulação de Carteira")
-    st.caption("Compra > 0 | Venda < 0. Venda travada pela posição atual. Compra travada por caixa disponível e vendas alimentam compras (ordem correta).")
+    st.caption(
+    "Ativos: ΔR$ (compra > 0, venda < 0) com travas de posição e caixa. "
+    "Derivativos: Δ ajusta somente a EXPOSIÇÃO (sem travas e sem contrapartida no caixa)."
+)
 
     if "headers" not in st.session_state or not st.session_state.headers:
         st.warning("Faça login para consultar os dados.")
@@ -741,6 +965,7 @@ def tela_simulacao() -> None:
 
     df_antes = st.session_state.sim_base_df
     overview = st.session_state.sim_overview
+    
 
     ativos_unicos = sorted(df_antes["instrument_name"].dropna().unique().tolist())
     value_col = _pick_col(df_antes, ["exposure_value", "last_exposure_value"])
@@ -752,16 +977,17 @@ def tela_simulacao() -> None:
             default_class = classes_ativo[0] if classes_ativo else "Sem Classe"
             st.session_state.sim_exist_rows[nome] = {"classe": default_class, "delta": 0.0}
 
-    def _on_change_delta(nome: str, pos_atual: float):
+    def _on_change_delta(nome: str, pos_atual: float, is_deriv: bool):
         _ensure_row(nome)
 
         key_txt = f"sim_delta_txt_{nome}"
         raw = str(st.session_state.get(key_txt, "0,00"))
         delta = _parse_ptbr_currency(raw)
 
-        # trava venda > posição
-        if delta < 0 and abs(delta) > pos_atual:
+        # trava venda > posição (SÓ não-derivativo)
+        if (not is_deriv) and delta < 0 and abs(delta) > pos_atual:
             delta = -float(pos_atual)
+
 
         st.session_state.sim_exist_rows[nome]["delta"] = float(delta)
         st.session_state[key_txt] = _fmt_ptbr_currency(float(delta))
@@ -823,6 +1049,11 @@ def tela_simulacao() -> None:
 
                 filtro = (df_antes["instrument_name"].astype(str) == str(nome)) & (df_antes["book_name"].astype(str) == str(classe))
                 pos_atual = float(pd.to_numeric(df_antes.loc[filtro, "asset_value"], errors="coerce").fillna(0.0).sum())
+                is_deriv = False
+                if filtro.sum() == 1:
+                    row_idx = df_antes.index[filtro][0]
+                    is_deriv = _is_deriv_row(df_antes, row_idx)
+
 
                 if value_col:
                     pos_expo = float(pd.to_numeric(df_antes.loc[filtro, value_col], errors="coerce").fillna(0.0).sum())
@@ -836,13 +1067,17 @@ def tela_simulacao() -> None:
                     st.session_state[key_txt] = _fmt_ptbr_currency(float(dado.get("delta", 0.0)))
 
                 st.text_input(
-                    "Δ R$",
+                    "Δ R$" if not is_deriv else "Δ Exposição",
                     key=key_txt,
                     on_change=_on_change_delta,
-                    args=(nome, pos_atual),
+                    args=(nome, pos_atual, is_deriv),
                 )
 
-                st.caption(f"Venda máx.: R$ {_format_ptbr_num(pos_atual)}")
+                if not is_deriv:
+                    st.caption(f"Venda máx.: R$ {_format_ptbr_num(pos_atual)}")
+                else:
+                    st.caption("Derivativo: soma Δ direto na exposição (sem trava e sem caixa).")
+
 
             st.markdown('</div>', unsafe_allow_html=True)
 
