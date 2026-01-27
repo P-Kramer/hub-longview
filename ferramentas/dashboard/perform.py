@@ -1418,10 +1418,12 @@ def tela_performance() -> None:
                         key=f"rank_n_{w}",
                     )
 
-                # -----------------------------
+               # -----------------------------
                 # 1) Retorno por preço no período (sempre calculo, pra poder cruzar)
                 # -----------------------------
-                sub_price = piv_inst_price.loc[(piv_inst_price.index >= start_ts) & (piv_inst_price.index <= end_ts_)].copy()
+                sub_price = piv_inst_price.loc[
+                    (piv_inst_price.index >= start_ts) & (piv_inst_price.index <= end_ts_)
+                ].copy()
                 sub_price = sub_price.dropna(axis=1, how="all")
 
                 if sub_price.empty:
@@ -1439,71 +1441,89 @@ def tela_performance() -> None:
                 # -----------------------------
                 # 2) PnL total no período (se tiver df_inst com PnL_Total)
                 # -----------------------------
-                pnl_df = pd.DataFrame(columns=["Instrumento", "PnL_Total"])
+                pnl_df = pd.DataFrame(columns=["Instrumento", "PnL_Total", "Qty_fim"])
 
-                if "df_inst" in locals() and df_inst is not None and not df_inst.empty and "PnL_Total" in df_inst.columns:
+                if df_inst is not None and (not df_inst.empty) and ("PnL_Total" in df_inst.columns):
                     sub_pnl = df_inst[(df_inst["Data"] >= start_ts) & (df_inst["Data"] <= end_ts_)].copy()
                     sub_pnl["PnL_Total"] = pd.to_numeric(sub_pnl["PnL_Total"], errors="coerce")
-                    pnl_df = pd.DataFrame(columns=["Instrumento", "PnL_Total", "Qty_fim"])
+                    sub_pnl["Qty"] = pd.to_numeric(sub_pnl.get("Qty"), errors="coerce")
 
-                    if df_inst is not None and not df_inst.empty and "PnL_Total" in df_inst.columns:
-                        sub_pnl = df_inst[(df_inst["Data"] >= start_ts) & (df_inst["Data"] <= end_ts_)].copy()
-                        sub_pnl["PnL_Total"] = pd.to_numeric(sub_pnl["PnL_Total"], errors="coerce")
-                        sub_pnl["Qty"] = pd.to_numeric(sub_pnl["Qty"], errors="coerce")
+                    # soma PnL no período
+                    pnl_sum = (
+                        sub_pnl.dropna(subset=["Instrumento"])
+                            .groupby("Instrumento", as_index=False)["PnL_Total"]
+                            .sum()
+                    )
 
-                        # soma PnL no período
-                        pnl_sum = (
-                            sub_pnl.dropna(subset=["Instrumento"])
-                                .groupby("Instrumento", as_index=False)["PnL_Total"]
-                                .sum()
-                        )
+                    # qty no fim do período (última linha por instrumento)
+                    qty_end = (
+                        sub_pnl.sort_values(["Instrumento", "Data"])
+                            .groupby("Instrumento", as_index=False)
+                            .tail(1)[["Instrumento", "Qty"]]
+                            .rename(columns={"Qty": "Qty_fim"})
+                    )
 
-                        # qty no fim do período (última linha por instrumento)
-                        qty_end = (
-                            sub_pnl.sort_values(["Instrumento", "Data"])
-                                .groupby("Instrumento", as_index=False)
-                                .tail(1)[["Instrumento", "Qty"]]
-                                .rename(columns={"Qty": "Qty_fim"})
-                        )
+                    pnl_df = pnl_sum.merge(qty_end, on="Instrumento", how="left")
 
-                        pnl_df = pnl_sum.merge(qty_end, on="Instrumento", how="left")
-
-
+                # -----------------------------
                 # junta retorno + pnl
+                # -----------------------------
                 rank = ret_df.merge(pnl_df, on="Instrumento", how="left")
 
-                # formata colunas auxiliares
-                rank["Valorização do Ativo (%)"] = (rank["Retorno"] * 100.0).round(2)
-
+                # colunas auxiliares numéricas
+                rank["Valorização do Ativo (%)"] = (pd.to_numeric(rank["Retorno"], errors="coerce") * 100.0).round(2)
+                rank["PnL_Total"] = pd.to_numeric(rank.get("PnL_Total"), errors="coerce")
                 rank["Qty_fim"] = pd.to_numeric(rank.get("Qty_fim"), errors="coerce")
 
+                # posição
                 rank["Posição"] = np.where(
                     rank["Qty_fim"].fillna(0) > 0, "Comprado",
                     np.where(rank["Qty_fim"].fillna(0) < 0, "Vendido", "Zerado")
-)
+                )
 
-
+                # -----------------------------
                 # ordenação conforme critério
+                # -----------------------------
                 if rank_metric == "Valorização do Ativo":
-                    # Top = maiores retornos, Bottom = menores retornos
                     rank = rank.dropna(subset=["Retorno"])
                     ascending = (rank_side == "Bottom")
                     rank = rank.sort_values("Retorno", ascending=ascending).head(int(n_rank))
                 else:
-                    # PnL: Top = maior pnl, Bottom = menor pnl
                     rank = rank.dropna(subset=["PnL_Total"])
                     ascending = (rank_side == "Bottom")
                     rank = rank.sort_values("PnL_Total", ascending=ascending).head(int(n_rank))
 
+                # -----------------------------
                 # exibição (mantém as duas infos)
+                # -----------------------------
                 show_cols = ["Instrumento", "Posição", "Valorização do Ativo (%)"]
-
                 if "PnL_Total" in rank.columns:
                     show_cols.append("PnL_Total")
+
                 rank_show = rank[show_cols].copy()
 
-                # arredonda PnL para ficar legível
+                # garante numérico (para column_config)
+                rank_show["Valorização do Ativo (%)"] = pd.to_numeric(rank_show["Valorização do Ativo (%)"], errors="coerce")
                 if "PnL_Total" in rank_show.columns:
-                    rank_show["PnL_Total"] = pd.to_numeric(rank_show["PnL_Total"], errors="coerce").round(2)
+                    rank_show["PnL_Total"] = pd.to_numeric(rank_show["PnL_Total"], errors="coerce")
 
-                st.dataframe(rank_show, use_container_width=True, hide_index=True, key=f"rank_table_{w}")
+                # força formato com 2 casas (e R$ com milhar)
+                col_cfg = {
+                    "Valorização do Ativo (%)": st.column_config.NumberColumn(
+                        "Valorização do Ativo (%)",
+                        format="%.2f",
+                    ),
+                }
+                if "PnL_Total" in rank_show.columns:
+                    col_cfg["PnL_Total"] = st.column_config.NumberColumn(
+                        "PnL_Total",
+                        format="R$ %,.2f",
+                    )
+
+                st.dataframe(
+                    rank_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    key=f"rank_table_{w}",
+                    column_config=col_cfg,
+                )
