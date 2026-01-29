@@ -16,6 +16,117 @@ from utils import BASE_URL_API, CARTEIRAS  # CARTEIRAS: {id: nome}
 # =========================
 # API
 # =========================
+CARTEIRAS_OCULTAS = {
+    "307",   # exemplo: carteira interna, espelho, teste
+    "308",
+    "1361"
+}
+
+
+
+def aplicar_regras_consolidacao_pl(df_long: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    UMA função com regras hardcoded:
+      - exclusão mútua (espelhos)
+      - include (pai inclui filha)
+      - investimento cruzado parcial (A investe X% em B)
+
+    Retorna:
+      (df_long_ajustado, report)
+
+    IMPORTANTE:
+      - Tudo por portfolio_id (string)
+      - Investimento cruzado aqui é um ajuste de PL por carteira (aproximação),
+        NÃO é look-through por instrumento.
+    """
+
+    if df_long.empty:
+        return df_long, {"drops": [], "pl_adjustments": {}}
+
+    df = df_long.copy()
+    df["portfolio_id"] = df["portfolio_id"].astype(str)
+
+    # =========================================================
+    # REGRAS (edite aqui dentro, como você quer)
+    # =========================================================
+
+    # 1) Grupos que NÃO podem coexistir: mantém o primeiro da lista
+    EXCLUSAO_MUTUA = [
+        ["1212", "307"],              # exemplo: espelho -> fica 101, drop 102
+        ["1211", "308"],
+        ["1478","1361"]       # exemplo: variações da mesma carteira
+    ]
+
+    # 3) Investimento cruzado parcial:
+    #    ("A", "B", 0.70) => A investe 70% do seu PL em B.
+    #    Se A e B estiverem selecionadas, reduz o PL de A em 70% (aproximação).
+    INVESTE_EM = [
+        ("401", "402", 0.70),
+        # ("A", "B", 0.25),
+    ]
+
+    # =========================================================
+    # 0) conjuntos e PL base
+    # =========================================================
+    presentes = set(df["portfolio_id"].unique())
+    pl_base = df.groupby("portfolio_id")["asset_value"].sum().to_dict()
+
+    drops = set()
+
+    # =========================================================
+    # 1) Exclusão mútua
+    # =========================================================
+    for grupo in EXCLUSAO_MUTUA:
+        grupo = [str(x) for x in grupo]
+        presentes_grupo = [pid for pid in grupo if pid in presentes and pid not in drops]
+        if len(presentes_grupo) > 1:
+            # mantém o primeiro na ordem definida
+            drops.update(presentes_grupo[1:])
+
+
+    # aplica drops
+    if drops:
+        df = df[~df["portfolio_id"].isin(drops)].copy()
+
+    # recalcula PL após drops (porque muda universo)
+    pl = df.groupby("portfolio_id")["asset_value"].sum().to_dict()
+
+    # =========================================================
+    # 3) Ajuste por investimento cruzado parcial (netting)
+    # =========================================================
+    # regra: se A e B estiverem presentes (e não dropados), reduz PL(A) por pct*PL(A)
+    # e distribui esse ajuste proporcionalmente nas linhas de A (para não quebrar heatmap)
+    ajustes_pl = {}  # pid -> fator multiplicativo final
+
+    # começa com fator 1.0
+    for pid in pl.keys():
+        ajustes_pl[pid] = 1.0
+
+    for a, b, pct in INVESTE_EM:
+        a, b = str(a), str(b)
+        pct = float(pct)
+
+        if a in pl and b in pl:
+            # reduz A por pct do próprio A
+            # fator vira (1 - pct). Se tiver múltiplas relações, multiplica fatores.
+            ajustes_pl[a] *= (1.0 - pct)
+
+    # aplica fatores nas linhas de cada carteira
+    # (proporcional: multiplicar asset_value por fator do portfolio)
+    df["asset_value"] = df.apply(
+        lambda r: float(r["asset_value"]) * float(ajustes_pl.get(str(r["portfolio_id"]), 1.0)),
+        axis=1,
+    )
+
+    report = {
+        "drops": sorted(drops),
+        "pl_adjustments_factor": {k: round(v, 6) for k, v in ajustes_pl.items() if abs(v - 1.0) > 1e-12},
+        "pl_base": {k: float(pl_base.get(k, 0.0)) for k in sorted(pl_base.keys())},
+        "pl_final": {k: float(df[df["portfolio_id"] == k]["asset_value"].sum()) for k in sorted(df["portfolio_id"].unique())},
+    }
+
+    return df, report
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_positions_all_portfolios(data_base: date, portfolio_ids: List[str], headers: Dict[str, str]) -> pd.DataFrame:
     """
@@ -99,31 +210,51 @@ def _compute_pl_by_portfolio(df_long: pd.DataFrame) -> pd.Series:
     return df_long.groupby("portfolio_name")["asset_value"].sum()
 
 
-def _allocation_by_book_pct(df_long: pd.DataFrame) -> pd.DataFrame:
+def _allocation_by_book_pct(df_long: pd.DataFrame, modo: str = "Subclasse") -> pd.DataFrame:
     """
-    Retorna DF: portfolio_name | book_name | value | pct
+    modo:
+      - "Subclasse" -> book_name completo (como vem)
+      - "Classe"    -> pega antes do '>>'
+    Retorna DF: portfolio_name | book_key | value | pct
     """
-    grp = df_long.groupby(["portfolio_name", "book_name"], as_index=False)["asset_value"].sum()
+    tmp = df_long.copy()
+
+    if modo == "Classe":
+        tmp["book_key"] = (
+            tmp["book_name"]
+            .astype(str)
+            .str.split(">>", n=1)
+            .str[0]
+            .str.strip()
+            .replace("", "Sem Classe")
+        )
+    else:
+        tmp["book_key"] = tmp["book_name"].astype(str).str.strip().replace("", "Sem Classe")
+
+    grp = tmp.groupby(["portfolio_name", "book_key"], as_index=False)["asset_value"].sum()
     pl = grp.groupby("portfolio_name")["asset_value"].transform("sum")
+
     grp["pct"] = grp["asset_value"] / pl.replace(0, pd.NA)
     grp["pct"] = grp["pct"].fillna(0.0)
+
     grp = grp.rename(columns={"asset_value": "value"})
     return grp
 
 
+
 def _heatmap_df(alloc: pd.DataFrame, top_books: int = 25) -> pd.DataFrame:
     """
-    Pivota para portfolio x book.
-    Reduz dimensão pegando top books por soma total.
+    Pivota para portfolio x book_key.
+    Reduz dimensão pegando top por soma total.
     """
-    book_tot = alloc.groupby("book_name")["value"].sum().sort_values(ascending=False)
+    book_tot = alloc.groupby("book_key")["value"].sum().sort_values(ascending=False)
     keep = book_tot.head(int(top_books)).index.tolist()
-    sub = alloc[alloc["book_name"].isin(keep)].copy()
+    sub = alloc[alloc["book_key"].isin(keep)].copy()
 
-    piv = sub.pivot_table(index="portfolio_name", columns="book_name", values="pct", aggfunc="sum").fillna(0.0)
-    # ordena colunas por relevância
+    piv = sub.pivot_table(index="portfolio_name", columns="book_key", values="pct", aggfunc="sum").fillna(0.0)
     piv = piv[keep]
     return piv
+
 
 import re
 
@@ -264,15 +395,29 @@ def render(ctx) -> None:
         st.warning("Faça login para consultar os dados.")
         return
 
-    c1, c2, c3 = st.columns([1.2, 1.6, 1.2])
+    c1, c2, c3, c4 = st.columns([1.2, 1.3, 1.3, 1.2])
     with c1:
         data_base = st.date_input("Data-base", value=date.today(), key="ov_data_base")
     with c2:
-        top_books = st.number_input("Top classes (books) no heatmap", min_value=5, max_value=80, value=25, step=5)
+        top_books = st.number_input("Top classes (books) no heatmap", min_value=5, max_value=35, value=15, step=5)
     with c3:
+        modo_heatmap = st.selectbox("Heatmap por", options=["Subclasse", "Classe"], index=0, key="ov_heatmap_modo")
+    with c4:
         only_selected = st.checkbox("Selecionar carteiras", value=False)
 
-    all_portfolios = [(str(pid), name) for pid, name in CARTEIRAS.items()]
+
+    # -------------------------
+    # Carteiras escondidas / bloqueadas na UI
+    # -------------------------
+
+    # monta lista de carteiras já filtrada
+    all_portfolios = [
+        (str(pid), name)
+        for pid, name in CARTEIRAS.items()
+        if str(pid) not in CARTEIRAS_OCULTAS
+    ]
+
+    # ids default só das visíveis
     selected_ids = [pid for pid, _ in all_portfolios]
 
     if only_selected:
@@ -295,21 +440,15 @@ def render(ctx) -> None:
         st.info("Sem posições retornadas para a data/carteiras selecionadas.")
         return
 
-    # KPIs rápidos
-    pl = _compute_pl_by_portfolio(df_long)
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.metric("Carteiras", f"{pl.shape[0]}")
-    with k2:
-        st.metric("PL total", f"R$ {pl.sum():,.0f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    with k3:
-        st.metric("Posições (linhas)", f"{df_long.shape[0]}")
+
+
 
     st.divider()
 
-    st.markdown("#### Heatmap — % alocado por classe (book)")
+    st.markdown(f"#### Heatmap — % alocado por {('subclasse' if modo_heatmap=='Subclasse' else 'classe')} (book)")
 
-    alloc = _allocation_by_book_pct(df_long)
+
+    alloc = _allocation_by_book_pct(df_long, modo=modo_heatmap)
     piv = _heatmap_df(alloc, top_books=int(top_books))
 
     # matriz em %
@@ -345,7 +484,7 @@ def render(ctx) -> None:
             zmin=0,
             zmax=float(np.nanmax(z) if np.isfinite(z).any() else 100),
             colorbar=dict(title="% do PL", ticksuffix="%"),
-            hovertemplate="Carteira=%{y}<br>Classe=%{x}<br>% do PL=%{z:.2f}%<extra></extra>",
+            hovertemplate="Carteira=%{y}<br>Book=%{x}<br>% do PL=%{z:.2f}%<extra></extra>",
         )
     )
 
@@ -380,7 +519,7 @@ def render(ctx) -> None:
     )
 
     # ---- eixos (books em cima)
-    fig.update_xaxes(side="top", tickangle=-45, tickfont=dict(size=11), title="Classe (book)")
+    fig.update_xaxes(side="top", tickangle=-45, tickfont=dict(size=11), title=f"Book ({modo_heatmap})")
     fig.update_yaxes(tickfont=dict(size=11), title="Carteira")
 
     fig.update_layout(
@@ -390,9 +529,9 @@ def render(ctx) -> None:
 
     st.plotly_chart(fig, use_container_width=True)
 
+    prefix = "subclasse" if modo_heatmap == "Subclasse" else "classe"
 
-
-    with st.expander("Tabela (% por classe)"):
+    with st.expander(f"Tabela (% por {prefix})"):
         show = piv.copy()                 # piv é 0..1
         show_pct = (show * 100).round(2)  # só pra visualizar
 
@@ -402,15 +541,17 @@ def render(ctx) -> None:
         df_num = show.copy()  # 0..1
         df_100 = (show * 100.0)  # 0..100
 
+        
         xls = _excel_bytes_formatado([
-            ("heatmap_pct_01", df_num, True, {c: "pct0_1" for c in df_num.columns}),
-            ("heatmap_pct_100", df_100, True, {c: "pct0_2" for c in df_100.columns}),
+            (f"heatmap_{prefix}_pct_01", df_num, True, {c: "pct0_1" for c in df_num.columns}),
+            (f"heatmap_{prefix}_pct_100", df_100, True, {c: "pct0_2" for c in df_100.columns}),
         ])
 
+
         st.download_button(
-            "Baixar tabela (% por classe) — Excel",
+            f"Baixar tabela (% por {prefix}) — Excel",
             data=xls,
-            file_name=f"overview_heatmap_pct_{str(data_base)}.xlsx",
+            file_name=f"overview_heatmap_{prefix}_{str(data_base)}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             key="ov_dl_heatmap_xlsx",

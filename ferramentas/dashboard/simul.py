@@ -1057,7 +1057,8 @@ def tela_simulacao() -> None:
 
                 if value_col:
                     pos_expo = float(pd.to_numeric(df_antes.loc[filtro, value_col], errors="coerce").fillna(0.0).sum())
-                    st.caption(f"Posição atual: R$ {_format_ptbr_num(pos_atual)} | Exposição: R$ {_format_ptbr_num(pos_expo)}")
+                    pl_before = float(pd.to_numeric(df_antes.get("asset_value", 0), errors="coerce").fillna(0.0).sum())
+                    st.caption(f"Exposição: R$ {_format_ptbr_num(pos_expo)} ({pos_expo/pl_before * 100:.1f} %)")
                 else:
                     st.caption(f"Posição atual: R$ {_format_ptbr_num(pos_atual)}")
 
