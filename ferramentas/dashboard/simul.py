@@ -727,6 +727,9 @@ def _init_state():
         st.session_state.sim_overview = {}
     if "sim_loaded_key" not in st.session_state:
         st.session_state.sim_loaded_key = None
+    if "sim_loaded" not in st.session_state:
+        st.session_state.sim_loaded = False
+
 
 
 # ======================================================
@@ -946,7 +949,16 @@ def tela_simulacao() -> None:
         return
 
     load_key = f"{carteira_id}|{str(data_base)}"
-    if carregar or st.session_state.sim_base_df is None or st.session_state.sim_loaded_key != load_key:
+    load_key = f"{carteira_id}|{str(data_base)}"
+
+# Se mudou data/carteira, invalida o carregamento e não mostra nada até clicar
+    if st.session_state.sim_loaded_key != load_key:
+        st.session_state.sim_loaded = False
+        st.session_state.sim_base_df = None
+        st.session_state.sim_overview = {}
+        st.session_state.sim_exist_rows = {}
+
+    if carregar:
         try:
             with st.spinner("Buscando posições..."):
                 df_antes, overview = _carregar_posicoes(data_base, carteira_id, st.session_state.headers)
@@ -962,6 +974,13 @@ def tela_simulacao() -> None:
         st.session_state.sim_overview = overview
         st.session_state.sim_loaded_key = load_key
         st.session_state.sim_exist_rows = {}
+        st.session_state.sim_loaded = True
+
+    # GATE: nada abaixo aparece sem clique
+    if not st.session_state.sim_loaded:
+        st.info("Selecione data e carteira e clique em **Carregar Base** para iniciar a simulação.")
+        return
+
 
     df_antes = st.session_state.sim_base_df
     overview = st.session_state.sim_overview
